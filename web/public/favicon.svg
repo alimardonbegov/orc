@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- The orc mark: an orc's head with phosphor eyes. Geometry: web/src/brand/OrcMark.tsx, rules: docs/design/brand.md -->
+  <style>
+    path { fill: #1b1f27; }
+    .eye { fill: #16a34a; }
+    @media (prefers-color-scheme: dark) {
+      path { fill: #e9ebf0; }
+      .eye { fill: #4ade80; }
+    }
+  </style>
+  <path d="M5 4h22l3 9-2 5H4l-2-5z"/><path d="M3.2 9 0 5.5 2.4 15z M28.8 9 32 5.5 29.6 15z"/><path d="M6 23h20l-3 6H9z"/><path d="M6.5 23 9.5 13.5l3 9.5z M19.5 23 22.5 13.5l3 9.5z"/><path class="eye" d="M8.5 11.5l5.5-1.5V14H8.5z M23.5 11.5l-5.5-1.5V14h5.5z"/>
+</svg>

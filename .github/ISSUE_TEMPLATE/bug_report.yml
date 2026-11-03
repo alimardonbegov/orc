@@ -1,0 +1,67 @@
+name: Bug report
+description: Something does not work as expected
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. For security problems please do not use this form: follow
+        [SECURITY.md](https://github.com/alimardonbegov/orc/blob/main/SECURITY.md) instead.
+        Do not paste tokens or private repository contents; run `orc doctor` and include its output.
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.1, Ubuntu 24.04
+    validations:
+      required: true
+  - type: input
+    id: python
+    attributes:
+      label: Python version
+      placeholder: "3.12.7"
+    validations:
+      required: true
+  - type: input
+    id: claude-version
+    attributes:
+      label: Claude Code version
+      description: Output of `claude --version`.
+    validations:
+      required: true
+  - type: input
+    id: orc-version
+    attributes:
+      label: orc version
+      description: The version from `pyproject.toml` or the wheel name, or the commit if you run from a clone.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add a project ...
+        2. Create a card ...
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and `orc doctor` output
+      description: The server log (`.run/orc.log` in a clone, or the file given to `--log-file`). Remove anything private.
+      render: shell

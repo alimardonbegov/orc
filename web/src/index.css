@@ -1,0 +1,351 @@
+@import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;450;500;600;700&display=swap");
+@import "tailwindcss";
+
+/* ──────────────────────────────────────────────────────────────────────────
+   orc — a control panel for agents.
+
+   The palette rule the whole interface rests on: COLOR MEANS STATUS.
+   Chrome (buttons, panels, fields) is colorless graphite; any colored spot on
+   the screen is a task state. So the primary button is monochrome,
+   not a "brand" color: otherwise it would compete with the status badges.
+
+   The only exception is --live: the phosphor trace of the dispatcher heartbeat.
+   There is one on the whole screen and it means "the system is alive". The same color lights the eyes of
+   the orc in the mark (web/src/brand/OrcMark.tsx) — it is not a second brand color,
+   but the same state shown in another place. Brand: docs/design/brand.md.
+
+   The dark theme is the primary one (it is used at night, next to the terminal), the light one
+   is available via a switcher. Both are set through data-theme on <html>, the
+   "follow system" mode is picked up by prefers-color-scheme.
+   ────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* surfaces: canvas → surface → raised → sunken */
+  --canvas: #0b0d11;
+  --surface: #14171d;
+  --raised: #1b1f27;
+  --sunken: #0f1216;
+  --line: #262b35;
+  --line-strong: #363d4a;
+
+  --ink: #e9ebf0;
+  --ink-muted: #8d94a1;
+  --ink-faint: #616875;
+
+  /* monochrome primary button */
+  --primary: #e9ebf0;
+  --primary-ink: #0b0d11;
+
+  /* focus is neutral-bright so as not to be confused with statuses */
+  --focus: #9aa4b8;
+
+  /* signature: the phosphor trace "dispatcher is alive" */
+  --live: #4ade80;
+
+  /* status wheel: each hue stands far from its neighbors */
+  --st-backlog: #7b8494;
+  --st-todo: #38bdf8;
+  --st-progress: #f5a524;
+  --st-verifying: #a78bfa;
+  --st-merging: #2dd4bf;
+  --st-done: #4ade80;
+  --st-failed: #fb7185;
+  /* "waiting for an answer" is the only magenta on the screen: it is a call for a human */
+  --st-blocked: #f472b6;
+
+  --warn: #f5a524;
+  --danger: #fb7185;
+  --ok: #4ade80;
+
+  --radius: 10px;
+  --radius-sm: 7px;
+  --radius-lg: 14px;
+
+  /* shadows are graphite, not gray: on a dark background a gray shadow looks like dirt */
+  --shadow-pop: 0 1px 2px rgb(0 0 0 / 0.4), 0 12px 32px -8px rgb(0 0 0 / 0.55);
+  --shadow-card: 0 1px 2px rgb(0 0 0 / 0.25);
+
+  /* Dashboard series: the only place where color means not a status but a NAME — a model or
+     project in a bar stack. Eight hues in a fixed order, checked for
+     distinguishability under color blindness (script dataviz validate_palette) for this surface;
+     the ninth series folds into "other" in gray. The order is part of the check, not cosmetics. */
+  --cat-1: #3987e5;
+  --cat-2: #d95926;
+  --cat-3: #199e70;
+  --cat-4: #c98500;
+  --cat-5: #d55181;
+  --cat-6: #008300;
+  --cat-7: #9085e9;
+  --cat-8: #e66767;
+
+  color-scheme: dark;
+}
+
+/* Light theme: "paper and graphite". Status hues are darkened to a contrast
+   of at least 4.5:1 on white — on a light background the neon version is unreadable. */
+:root[data-theme="light"] {
+  --canvas: #f3f4f7;
+  --surface: #ffffff;
+  --raised: #ffffff;
+  --sunken: #eceef2;
+  --line: #dfe2e9;
+  --line-strong: #c4c9d4;
+
+  --ink: #14171d;
+  --ink-muted: #5b6270;
+  --ink-faint: #838a98;
+
+  --primary: #14171d;
+  --primary-ink: #ffffff;
+
+  --focus: #4b5563;
+
+  --live: #16a34a;
+
+  --st-backlog: #5b6270;
+  --st-todo: #0369a1;
+  --st-progress: #a55a00;
+  --st-verifying: #6d28d9;
+  --st-merging: #0f766e;
+  --st-done: #15803d;
+  --st-failed: #be123c;
+  --st-blocked: #be185d;
+
+  --warn: #a55a00;
+  --danger: #be123c;
+  --ok: #15803d;
+
+  --shadow-pop: 0 1px 2px rgb(16 18 24 / 0.06), 0 12px 32px -8px rgb(16 18 24 / 0.18);
+  --shadow-card: 0 1px 2px rgb(16 18 24 / 0.05);
+
+  /* The same eight hues, tuned for a white surface (not an auto-inversion) */
+  --cat-1: #2a78d6;
+  --cat-2: #eb6834;
+  --cat-3: #1baf7a;
+  --cat-4: #eda100;
+  --cat-5: #e87ba4;
+  --cat-6: #008300;
+  --cat-7: #4a3aa7;
+  --cat-8: #e34948;
+
+  color-scheme: light;
+}
+
+/* "Follow system" mode: the same light values, but only if the OS is light
+   and the user has not chosen a theme by hand. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]):not([data-theme="light"]) {
+    --canvas: #f3f4f7;
+    --surface: #ffffff;
+    --raised: #ffffff;
+    --sunken: #eceef2;
+    --line: #dfe2e9;
+    --line-strong: #c4c9d4;
+    --ink: #14171d;
+    --ink-muted: #5b6270;
+    --ink-faint: #838a98;
+    --primary: #14171d;
+    --primary-ink: #ffffff;
+    --focus: #4b5563;
+    --live: #16a34a;
+    --st-backlog: #5b6270;
+    --st-todo: #0369a1;
+    --st-progress: #a55a00;
+    --st-verifying: #6d28d9;
+    --st-merging: #0f766e;
+    --st-done: #15803d;
+    --st-failed: #be123c;
+    --st-blocked: #be185d;
+    --warn: #a55a00;
+    --danger: #be123c;
+    --ok: #15803d;
+    --shadow-pop: 0 1px 2px rgb(16 18 24 / 0.06), 0 12px 32px -8px rgb(16 18 24 / 0.18);
+    --shadow-card: 0 1px 2px rgb(16 18 24 / 0.05);
+    --cat-1: #2a78d6;
+    --cat-2: #eb6834;
+    --cat-3: #1baf7a;
+    --cat-4: #eda100;
+    --cat-5: #e87ba4;
+    --cat-6: #008300;
+    --cat-7: #4a3aa7;
+    --cat-8: #e34948;
+    color-scheme: light;
+  }
+}
+
+@theme inline {
+  --color-canvas: var(--canvas);
+  --color-surface: var(--surface);
+  --color-raised: var(--raised);
+  --color-sunken: var(--sunken);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-ink: var(--ink);
+  --color-ink-muted: var(--ink-muted);
+  --color-ink-faint: var(--ink-faint);
+  --color-primary: var(--primary);
+  --color-primary-ink: var(--primary-ink);
+  --color-focus: var(--focus);
+  --color-live: var(--live);
+  --color-warn: var(--warn);
+  --color-danger: var(--danger);
+  --color-ok: var(--ok);
+
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  --radius-card: var(--radius);
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--canvas);
+  color: var(--ink);
+  font-family: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  /* Dense tool: base 13px, not 16 — four columns live side by side on the board */
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+
+::selection {
+  background: color-mix(in oklab, var(--focus) 35%, transparent);
+}
+
+/* Scrollbars are thin and appear only when hovering the container:
+   columns with permanent bars look like a grille. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--line);
+  border-radius: 99px;
+}
+*:hover::-webkit-scrollbar-thumb {
+  background: var(--line-strong);
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Digits in counters and identifiers must not "breathe" on update */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Motion ──────────────────────────────────────────────────────────────
+   Animations respond to a person's action (open, close, expand) and
+   never play on their own. The only background one is the "dispatcher is alive" pulse,
+   and it also fades out under prefers-reduced-motion. */
+
+@keyframes orc-pop-in {
+  from {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+@keyframes orc-pop-out {
+  to {
+    opacity: 0;
+    transform: translateY(-4px) scale(0.98);
+  }
+}
+@keyframes orc-fade-in {
+  from {
+    opacity: 0;
+  }
+}
+@keyframes orc-fade-out {
+  to {
+    opacity: 0;
+  }
+}
+@keyframes orc-sheet-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+}
+@keyframes orc-sheet-out {
+  to {
+    opacity: 0;
+    transform: translateY(8px) scale(0.985);
+  }
+}
+@keyframes orc-pulse {
+  50% {
+    opacity: 0.35;
+    box-shadow: 0 0 0 3px color-mix(in oklab, var(--live) 18%, transparent);
+  }
+}
+/* "Running light" under the header while at least one agent is actually working */
+@keyframes orc-trace {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(400%);
+  }
+}
+
+[data-state="open"].orc-anim-pop {
+  animation: orc-pop-in 130ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+[data-state="closed"].orc-anim-pop {
+  animation: orc-pop-out 100ms ease-in;
+}
+[data-state="open"].orc-anim-fade {
+  animation: orc-fade-in 140ms ease-out;
+}
+[data-state="closed"].orc-anim-fade {
+  animation: orc-fade-out 110ms ease-in;
+}
+[data-state="open"].orc-anim-sheet {
+  animation: orc-sheet-in 170ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+[data-state="closed"].orc-anim-sheet {
+  animation: orc-sheet-out 120ms ease-in;
+}
+
+.orc-pulse {
+  animation: orc-pulse 2.4s ease-in-out infinite;
+}
+/* The mark's eyes breathe at the same rhythm as the dispatcher dot: it is one signal */
+@keyframes orc-eyes-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+.orc-eyes-pulse {
+  animation: orc-eyes-pulse 2.4s ease-in-out infinite;
+}
+.orc-trace {
+  animation: orc-trace 2.2s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* While dragging a card the cursor must stay "grabbing" over the whole window */
+body[data-dragging="true"] * {
+  cursor: grabbing !important;
+}

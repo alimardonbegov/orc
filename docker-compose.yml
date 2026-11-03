@@ -1,0 +1,26 @@
+# One orc service = backend + built frontend static files in a single process (see Dockerfile).
+#
+# network_mode: host is deliberate: orc/security.py lets the server listen on loopback
+# (127.0.0.1) only, which protects against remote code execution through verify_cmd.
+# With host networking the container's 127.0.0.1 is the host's 127.0.0.1, so the port
+# does not need to be published via ports/-p (and must not be: a bridge network does
+# not provide this kind of access at all).
+#
+# ${HOME}:${HOME}: the dispatcher runs `claude` (it needs ~/.claude for jobs and
+# authorization) and works with the task git repositories by their absolute host paths
+# (usually somewhere under the home directory). The simplest way is to give the container
+# the same absolute paths the native process sees. user: "${UID}:${GID}" keeps the files
+# the container writes (jobs, worktrees, sessions) on the host with your ownership, not
+# root's.
+services:
+  orc:
+    build: .
+    network_mode: host
+    user: "${UID:-1000}:${GID:-1000}"
+    environment:
+      HOME: ${HOME}
+      ORC_DATA_DIR: /app/data
+    volumes:
+      - ${HOME}:${HOME}
+      - ./data:/app/data
+    restart: unless-stopped
