@@ -10,7 +10,7 @@ from orc.config import Settings
 from orc.dispatcher import Dispatcher
 from orc.machine import MachineLoad
 from orc.models import TaskStatus
-from orc.report import REPORT_REL_PATH
+from orc.handoff import REPORT_REL_PATH
 
 
 def _line(msg_id, out, model="claude-opus-5"):

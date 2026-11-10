@@ -1,18 +1,22 @@
 """The queue of owner messages into a task's session.
 
-The only place where the owner's text reaches a running session. Invariant: a resume
-is done only when the state has been READ and the daemon does not consider the session alive; it was exactly
-the violation of this that produced a second session in one worktree. The text itself travels either through the inbox
-(orc/inbox.py, a hook on the nearest tool call) or by a resume after a stop.
+The only place where the owner's text reaches a running session. A live session gets it typed into its own input
+box (orc/session_input.py), exactly like console input. When that is not possible, the text travels through the
+inbox (orc/inbox.py, a hook on the nearest tool call) or by a resume after a stop.
+
+Invariant: a resume is done only when the state has been READ and the daemon does not consider the session alive;
+it was exactly the violation of this that produced a second session in one worktree.
 """
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from orc import inbox
-from orc.models import Task, TaskStatus
+from orc import inbox, session_input, transcript
+from orc.claude_cli import ClaudeCliError, JobState
+from orc.models import Blocker, Task, TaskStatus
 from orc.repo import Repo
 from orc.sessions import RESUMABLE_STATES, SessionRunner
 
@@ -22,6 +26,9 @@ log = logging.getLogger("orc.delivery")
 # the delivery stuck. 10 ticks is 5 minutes at the default poll_interval_sec=30: that is how long the
 # longest model reply lives without a single tool call.
 DELIVERY_STALL_TICKS = 10
+# How many times a message is typed without a receipt before it goes through the fallback channels. An attempt
+# costs seconds per tick, and a client that cannot reach the input box will not get better on its own.
+TYPING_ATTEMPTS = 3
 
 
 class MessageDelivery:
@@ -30,6 +37,8 @@ class MessageDelivery:
         self.cli = cli
         self.sessions = sessions
         self.on_event = on_event
+        # Per message, in memory: a restart is exactly when typing deserves another chance.
+        self._typing_attempts: dict[int, int] = {}
 
     def pending_tasks(self) -> list[int]:
         return self.repo.tasks_with_pending_messages()
@@ -53,11 +62,16 @@ class MessageDelivery:
             self.fail_messages(task, pending, "the task session has ended")
             return
         st = self.cli.read_state(task.job_id)
-        if st is None:
+        # A sleeper's session was shut down on purpose (orc/wakeups.py), possibly days ago: the daemon may have
+        # forgotten the job, and the message is what wakes it.
+        asleep = task.blocker == Blocker.SLEEPING
+        if st is None and not asleep:
             self._bump_attempts(task, pending)  # the state is not written yet, so just wait
             return
-        if st.state in RESUMABLE_STATES:
-            self._deliver_by_resume(task, pending, stopped=st.state == "stopped")
+        if st is None or st.state in RESUMABLE_STATES:
+            self._deliver_by_resume(task, pending)
+        elif self._deliver_by_typing(task, st, pending):
+            pass
         elif st.state == "working" and not st.waiting and not any(m["mode"] == "interrupt" for m in pending):
             self._deliver_through_inbox(task, pending)
         else:
@@ -65,6 +79,78 @@ class MessageDelivery:
             # or working with tempo=idle, or working with tempo=blocked): there are no tool calls
             # (or they are interrupted on purpose), the hook cannot reach it, so delivery only by stopping.
             self._stop_for_delivery(task, pending)
+
+    def _deliver_by_typing(self, task: Task, st: JobState, pending: list[dict]) -> bool:
+        """The console channel: type into the live session's input box. False means use another channel.
+
+        The transcript is the receipt, so a session without a known transcript is left to the other channels:
+        an unconfirmed attempt could not be told from a lost one. An attempt without a receipt stays pending
+        and is checked against the transcript before the next one, which is what keeps the retry from
+        delivering the message twice.
+        """
+        if not st.transcript_path or task.outbox_state == "stopping":
+            return False  # a stop is under way: the resume that follows will carry the text
+        arrived = self._received_count(st, pending)
+        if arrived:
+            self._mark_typed(task, pending[:arrived], interrupted=False)
+            pending = pending[arrived:]
+            if not pending:
+                return True
+        if any(self._typing_attempts.get(m["id"], 0) >= TYPING_ATTEMPTS for m in pending):
+            return False
+        text = "\n\n".join(m["body"] for m in pending)
+        # On an open dialog Enter would pick the highlighted option, so Esc closes it first.
+        interrupt = any(m["mode"] == "interrupt" for m in pending) or self._dialog_open(task, st)
+        worktree = Path(task.worktree_path) if task.worktree_path else None
+        if worktree is not None and worktree.exists():
+            inbox.clear(worktree)  # a copy left for the hook would reach the session a second time
+        try:
+            received = self.cli.send_input(task.job_id, text, interrupt,
+                                           lambda: self._received_count(st, pending) == len(pending))
+        except ClaudeCliError as e:
+            log.warning("typing into the session of #%s: %s", task.id, e)
+            self._count_typing_attempt(pending)
+            return False
+        if received:
+            self._mark_typed(task, pending, interrupted=interrupt)
+            return True
+        self._count_typing_attempt(pending)
+        for message in pending:
+            self.repo.update_message(message["id"], state="sent", attempts=message["attempts"] + 1)
+        self.set_outbox_state(task, "sent")
+        return True
+
+    def _count_typing_attempt(self, pending: list[dict]) -> None:
+        for message in pending:
+            self._typing_attempts[message["id"]] = self._typing_attempts.get(message["id"], 0) + 1
+
+    @staticmethod
+    def _received_count(st: JobState, pending: list[dict]) -> int:
+        """How many messages from the head of the queue the transcript already has. A batch is typed as one text,
+        and a message queued after an attempt without a receipt was not part of what that attempt typed."""
+        since = datetime.fromisoformat(pending[0]["created_at"]).timestamp()
+        for count in range(len(pending), 0, -1):
+            text = session_input.prepare_text("\n\n".join(m["body"] for m in pending[:count]))
+            if transcript.session_received(st.transcript_path, text, since):
+                return count
+        return 0
+
+    def _dialog_open(self, task: Task, st: JobState) -> bool:
+        return self.repo.open_input_request(task.id) is not None or st.tempo == "blocked" or bool(st.needs)
+
+    def _mark_typed(self, task: Task, pending: list[dict], interrupted: bool) -> None:
+        for message in pending:
+            self.repo.mark_delivered(message["id"])
+            self._typing_attempts.pop(message["id"], None)
+        if interrupted:
+            # Esc cancelled the tool that was waiting for a decision.
+            self.sessions.close_input_requests(task)
+        fresh = self.repo.get_task(task.id) or task
+        if fresh.blocker == Blocker.NEEDS_INPUT and self.repo.open_input_request(task.id) is None:
+            self.repo.update_task(task.id, blocker=None, blocker_detail=None)
+        if not self.repo.pending_messages(task.id):
+            self.set_outbox_state(fresh, None)
+        self.on_event(task, f"#{task.id}: message sent to the session")
 
     def _confirm_delivered(self, task: Task) -> list[dict]:
         """Mark the messages that the hook has already handed to the session, and return the remaining ones."""
@@ -112,11 +198,11 @@ class MessageDelivery:
                 self.repo.update_message(message["id"], state="stopping", attempts=message["attempts"] + 1)
             self.set_outbox_state(task, "stopping")
         if self.sessions.wait_stopped(task):
-            self._deliver_by_resume(task, self.repo.pending_messages(task.id), stopped=True)
+            self._deliver_by_resume(task, self.repo.pending_messages(task.id))
             return
         self._bump_attempts(task, self.repo.pending_messages(task.id), touch=False)
 
-    def _deliver_by_resume(self, task: Task, pending: list[dict], stopped: bool = False) -> None:
+    def _deliver_by_resume(self, task: Task, pending: list[dict]) -> None:
         if not pending:
             return
         worktree = Path(task.worktree_path) if task.worktree_path else None
@@ -125,7 +211,7 @@ class MessageDelivery:
             # otherwise the hook would hand over the same message again.
             inbox.clear(worktree)
         text = "\n\n".join(m["body"] for m in pending)
-        self.sessions.resume(task, text, stopped=stopped)
+        self.sessions.resume(task, text, trigger="message")
         for message in pending:
             self.repo.mark_delivered(message["id"])
         self.set_outbox_state(self.repo.get_task(task.id) or task, None)

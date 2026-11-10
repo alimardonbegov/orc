@@ -28,7 +28,8 @@ import json
 from collections import Counter
 from datetime import date, datetime, timedelta, timezone
 
-from orc.models import Project, Task, TaskStatus
+from orc.agents import resolve_params
+from orc.models import Agent, Project, Task, TaskStatus
 from orc.token_usage import CACHE_1H_KEY, COUNTER_KEYS, _model_cost_usd
 from orc.util import utc_now
 
@@ -193,34 +194,34 @@ def model_costs(usage: dict | None, amount: float | None) -> dict[str, float]:
     return {model: amount * count / total_tokens for model, count in tokens.items()}
 
 
-def main_model(task: Task, usage: dict | None, project: Project | None = None) -> str:
-    """The model of the task as actually used, not as configured on the card.
+def main_model(task: Task, usage: dict | None, project: Project | None = None, agent: Agent | None = None) -> str:
+    """The model of the task as actually used, not as configured.
 
-    `tasks.model` may hold NULL (use the project default), while the transcript shows which
-    model really answered, and the session may have changed to a resume. We take the "heaviest"
-    one by tokens from the breakdown; if there is no breakdown, the card setting remains, and
-    after it the project default: that is exactly what the launch passed to `claude --model` (orc/sessions.py).
+    The transcript shows which model really answered, and the session may have changed to a resume.
+    We take the "heaviest" one by tokens from the breakdown; if there is no breakdown, the agent's
+    model remains, and after it the project default: that is exactly what the launch passed to
+    `claude --model` (orc/sessions.py). The card itself holds no model.
     """
     tokens = model_tokens(usage)
     if tokens:
         return max(tokens.items(), key=lambda kv: kv[1])[0]
-    return task.model or (project.default_model if project else None) or UNSET
+    return resolve_params(task, agent, project).model or UNSET
 
 
-def effective_effort(task: Task, project: Project | None) -> str:
-    """The effort level the task was actually launched with: the card, otherwise the project.
+def effective_effort(task: Task, project: Project | None, agent: Agent | None = None) -> str:
+    """The effort level the task was actually launched with: the agent's, otherwise the project's.
 
     If it is set in neither, `--effort` is not passed to the launch at all and Claude Code itself
     picks the level; the dashboard labels this separately (`UNSET`), because substituting a
     concrete value here would be a guess. The project default is taken as it is now: if it
     was changed after the launch, old tasks will be attributed to the new value.
     """
-    return task.effort or (project.default_effort if project else None) or UNSET
+    return resolve_params(task, agent, project).effort or UNSET
 
 
-def effective_permission(task: Task, project: Project | None) -> str:
-    """Session access mode: the card, otherwise the project (the project always has one)."""
-    return task.permission_mode or (project.default_permission_mode if project else None) or UNSET
+def effective_permission(task: Task, project: Project | None, agent: Agent | None = None) -> str:
+    """Session access mode: the agent's, otherwise the project's (the project always has one)."""
+    return resolve_params(task, agent, project).permission_mode or UNSET
 
 
 # ---------- time buckets ----------
@@ -380,6 +381,7 @@ def build(repo, project_id: int | None = None, days: int = 30, now: datetime | N
     now = now or utc_now()
     tasks = repo.list_tasks(project_id=project_id, archived=None)
     projects = {p.id: p for p in repo.list_projects()}
+    agents_by_id = {a.id: a for a in repo.list_agents()}
     starts = repo.first_session_times()
 
     created_stamps = [s for s in (parse_ts(t.created_at) for t in tasks) if s is not None]
@@ -495,10 +497,11 @@ def build(repo, project_id: int | None = None, days: int = 30, now: datetime | N
 
         project = projects.get(task.project_id)
         project_name = project.name if project else f"#{task.project_id}"
-        model = main_model(task, usage, project)
+        agent = agents_by_id.get(task.agent_id) if task.agent_id else None
+        model = main_model(task, usage, project, agent)
         models.setdefault(model, _Bucket()).add(task, tokens, amount, work)
-        efforts.setdefault(effective_effort(task, project), _Bucket()).add(task, tokens, amount, work)
-        permissions.setdefault(effective_permission(task, project), _Bucket()).add(task, tokens, amount, work)
+        efforts.setdefault(effective_effort(task, project, agent), _Bucket()).add(task, tokens, amount, work)
+        permissions.setdefault(effective_permission(task, project, agent), _Bucket()).add(task, tokens, amount, work)
         per_project.setdefault(project_name, _Bucket()).add(task, tokens, amount, work)
 
         row = flow.get(bucket_key(end, bucket))

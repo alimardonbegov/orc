@@ -12,11 +12,10 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from orc import git_ops, inbox
+from orc import failures, git_ops, handoff, inbox, task_guide, worktrees
 from orc.config import Settings
 from orc.models import Blocker, Project, Task, TaskStatus
 from orc.prompt import CONFLICT_TEMPLATE, build_conflict_prompt
-from orc.report import REPORT_REL_PATH, drop_report
 from orc.repo import Repo
 from orc.sessions import SessionRunner
 
@@ -31,7 +30,7 @@ CONFLICT_RETRY_LIMIT = 3
 
 class Merger:
     def __init__(self, repo: Repo, settings: Settings, sessions: SessionRunner, on_event: Callable[..., None],
-                 now: Callable[[], datetime], expand: Callable[[str], str], fail: Callable[[Task, str], None]):
+                 now: Callable[[], datetime], expand: Callable[[str], str], fail: Callable[..., None]):
         self.repo = repo
         self.settings = settings
         self.sessions = sessions
@@ -58,7 +57,8 @@ class Merger:
             try:
                 project = self.repo.get_project(task.project_id)
                 if project is None:
-                    self.fail(task, f"project #{task.project_id} was deleted, nowhere to merge")
+                    self.fail(task, f"project #{task.project_id} was deleted, nowhere to merge",
+                              failures.PROJECT_UNAVAILABLE)
                     continue
                 merged = self.merge(task, project)
             except Exception as e:
@@ -68,7 +68,8 @@ class Merger:
                 # one merge at a time" rule is about the absence of concurrent merges, not about a limit
                 # of one task per tick).
                 log.exception("merge #%s", task.id)
-                self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker_detail=f"merge failed: {e}")
+                self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker_detail=f"merge failed: {e}",
+                                      detail_code=self._merge_failure_code(task))
                 self.on_event(task, f"#{task.id} merge failed: {e}", "error")
                 continue
             if merged:
@@ -127,7 +128,25 @@ class Merger:
                 git_ops.push(merge_cwd, target)
             except Exception as e:
                 self.on_event(task, f"#{task.id}: the merge succeeded, but pushing {target} failed: {e}", "warn")
+        self._drop_merged_copy(task, project)
         return True
+
+    def _drop_merged_copy(self, task: Task, project: Project) -> None:
+        """The branch is fully in the target: the task's working copy only takes disk space, so remove it now.
+
+        Never fails the merge: whatever stays (busy folder, uncommitted files, switched off in settings) is picked
+        up later by the periodic cleanup (Dispatcher._cleanup_worktrees)."""
+        if self.repo.get_setting("worktree_autoclean", "1") != "1":
+            return
+        try:
+            fresh = self.repo.get_task(task.id) or task
+            removed = worktrees.remove_merged(self.repo, project, fresh, self.settings.claude_json_path)
+        except Exception:
+            log.exception("removing the working copy of merged task #%s", task.id)
+            return
+        if removed:
+            tail = f", branch {removed['dropped_branch']} deleted" if removed["dropped_branch"] else ""
+            self.on_event(task, f"#{task.id}: working copy {removed['name']} removed after the merge{tail}")
 
     def _merge_here(self, task: Task, project: Project, cwd: Path, target: str, branch: str,
                     message: str) -> bool:
@@ -203,13 +222,13 @@ class Merger:
         # goes round this loop every tick until the end of time (same trick as in _handle_failure).
         attempt = task.conflict_retry_count + 1
         task = self.repo.update_task(task.id, conflict_retry_count=attempt)
-        # The previous pass's report must disappear: otherwise _verify would let the task back into
-        # the merge on the old success, even if the conflict stayed unresolved.
-        drop_report(worktree)
+        # The previous pass's handoff must disappear: otherwise verification would let the task back into
+        # the merge on the old one, even if the conflict stayed unresolved.
+        task = handoff.clear(self.repo, task)
         inbox.clear(worktree)
         try:
             if task.session_id:
-                self.sessions.wake(task, prompt)
+                self.sessions.wake(task, prompt, trigger="conflict")
             else:
                 self._start_conflict_session(task, project, worktree, prompt)
         except Exception as e:
@@ -239,7 +258,7 @@ class Merger:
             self.repo.get_setting("conflict_prompt_template") or CONFLICT_TEMPLATE,
             title=task.title, description=self.expand(task.description), branch=branch,
             target_branch=target, verify_cmd=task.verify_cmd or project.verify_cmd or "not set",
-            report_path=REPORT_REL_PATH, files=files, incoming=incoming,
+            orc_command=task_guide.cli_command(self.sessions.settings.data_dir), files=files, incoming=incoming,
         )
 
     def _start_conflict_session(self, task: Task, project: Project, worktree: Path, prompt: str) -> None:
@@ -249,12 +268,24 @@ class Merger:
         this particular way. So this is a fallback, not the main path: it is better for
         whoever diverged the branches to reconcile them.
         """
-        self.sessions.start(task, project, worktree, prompt, f"orc#{task.id} conflict: {task.title}")
+        self.sessions.start(task, project, worktree, prompt, f"orc#{task.id} conflict: {task.title}",
+                            trigger="conflict")
+
+    def _merge_failure_code(self, task: Task) -> str | None:
+        """A merge that broke because the task branch is gone says so; any other break stays text only."""
+        try:
+            project = self.repo.get_project(task.project_id)
+            if project and task.branch and task.branch not in git_ops.list_branches(Path(project.path)):
+                return failures.BRANCH_GONE
+        except Exception:
+            log.debug("could not look for the branch of #%s", task.id, exc_info=True)
+        return None
 
     def _set_conflict(self, task: Task, target: str, branch: str, detail: str | None = None) -> None:
         self.repo.update_task(
             task.id, blocker=Blocker.CONFLICT,
             blocker_detail=detail or f"conflict merging {branch} into {target}, resolve it manually and clear the badge",
+            detail_code=failures.CONFLICT_UNRESOLVED,
         )
         self.on_event(task, f"#{task.id} conflict with {target}", "warn")
 

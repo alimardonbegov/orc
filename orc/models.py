@@ -31,6 +31,8 @@ class Blocker(StrEnum):
     QUOTA = "quota"
     # Claude Code does not trust the project folder: the start waits for the owner's explicit "trust" in the dashboard
     UNTRUSTED = "untrusted"
+    # The session asked to be woken later (orc/wakeups.py) and was shut down: no live process, no worker slot
+    SLEEPING = "sleeping"
 
 
 @dataclass
@@ -54,6 +56,10 @@ class Project:
     # Viewing results (orc/viewing.py): the project's finished tasks wait for the owner to look at them.
     # 0 means the project does not take part: no marks on cards, no counters.
     track_viewed: int = 1
+    # The project's lead agent (orc/agents.py); NULL means no lead
+    lead_agent_id: int | None = None
+    # What cards of this project show and start with (orc/card_settings.py), as JSON; NULL means as in orc
+    card_settings: str | None = None
 
 
 @dataclass
@@ -101,13 +107,40 @@ class Task:
     # NULL means a regular task (or the routine was deleted, and the run stays a regular task).
     routine_id: int | None = None
     routine_run: int | None = None
+    # The agent the task is allocated to (orc/agents.py); NULL means the project's parameters
+    agent_id: int | None = None
+    # The card whose session created this one (orc/task_plans.py); NULL means a person or a tool outside a card
+    created_by_task_id: int | None = None
+    # Idempotency key of the batch this card came from: a repeated request returns the same cards
+    batch_key: str | None = None
+    # The session's handoff (orc/handoff.py): when it came, in epoch seconds, and what it said (done | failed)
+    handoff_at: float | None = None
+    handoff_status: str | None = None
+    # Planning dates, YYYY-MM-DD: a plan for people, the dispatcher does not read them (orc/labels.py)
+    start_date: str | None = None
+    due_date: str | None = None
+    # The card this one is a subtask of: grouping only for the queue (it never waits on it), but a parent that opted
+    # in is woken when its subtasks are done (orc/child_wake.py). NULL means a top-level card
+    parent_task_id: int | None = None
+    # Wake this card when its subtasks are done: 1 yes, 0 no, NULL follows the project and orc settings
+    wake_on_children: int | None = None
+    children_wake_key: str | None = None   # fingerprint of the subtasks already reported to this card
+    children_wake_count: int = 0           # how many times the card was woken this way
+    resume_trigger: str | None = None      # why resume_with was queued (a run trigger); NULL means rework
+    # The stage among the siblings of one parent (orc/stages.py): a stage starts when the previous one is done.
+    # NULL means no stage; a stage without a parent is ignored
+    stage: int | None = None
+    # Why blocker_detail says what it says (orc/failures.py): a code the web translates. It travels with the text,
+    # so Repo.update_task clears it whenever blocker_detail is written without one. NULL means text only
+    detail_code: str | None = None
 
 
 @dataclass
 class Routine:
-    """A recurring task: the setup and the schedule. Each run is a separate task (Task)."""
+    """A recurring task: the setup and the schedule. Each run is a separate task (Task), or, for a
+    routine outside any project, a separate chat with its agent."""
     id: int
-    project_id: int
+    project_id: int | None      # NULL means a routine outside any project: the agent is mandatory
     title: str
     description: str
     priority: str
@@ -129,8 +162,59 @@ class Routine:
     archive_runs: int           # 1 means past finished runs go to the archive
     created_at: str
     updated_at: str
+    agent_id: int | None = None  # the agent every run is allocated to; NULL means the project's parameters
+
+
+@dataclass
+class Agent:
+    """A pre-configured executor: run parameters and an optional prompt (orc/agents.py)."""
+    id: int
+    name: str
+    description: str
+    avatar: str | None          # a small data:image URL or a short glyph; NULL means initials
+    model: str | None           # empty run parameters are inherited from the project
+    effort: str | None
+    permission_mode: str | None
+    prompt: str
+    project_id: int | None      # NULL means available everywhere; otherwise internal to that project
+    memory_enabled: int         # 1 means the agent's own memory directory across projects
+    created_at: str
+    updated_at: str
+
+
+@dataclass
+class Chat:
+    """A direct conversation with an agent: one Claude Code session in its own folder (orc/chats.py)."""
+    id: int
+    agent_id: int
+    project_id: int | None      # NULL means a chat outside any repository
+    title: str
+    status: str                 # idle | queued | running | waiting
+    cwd: str | None
+    branch: str | None
+    job_id: str | None
+    session_id: str | None
+    transcript_path: str | None
+    transcript_offset: int
+    turn_started_at: str | None
+    turn_progress: int
+    waiting_detail: str | None  # what the session is waiting for while status == waiting
+    usage_json: str | None
+    last_read_message_id: int
+    created_at: str
+    updated_at: str
+    # A run of a routine outside any project (orc/routines.py); NULL means an ordinary chat
+    routine_id: int | None = None
+    routine_run: int | None = None
+    # List organisation (orc/api/chats.py): 1 keeps the chat on top; a moment hides it from the default list
+    pinned: int = 0
+    archived_at: str | None = None
+    # Secret for this chat's input-request hook (orc/inputs.py), reissued with every set of session settings
+    hook_secret: str | None = None
 
 
 PROJECT_COLUMNS = {f.name for f in fields(Project)}
 TASK_COLUMNS = {f.name for f in fields(Task)}
 ROUTINE_COLUMNS = {f.name for f in fields(Routine)}
+AGENT_COLUMNS = {f.name for f in fields(Agent)}
+CHAT_COLUMNS = {f.name for f in fields(Chat)}

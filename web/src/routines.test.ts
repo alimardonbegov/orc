@@ -3,7 +3,7 @@ import { joinInterval, runDuration, runOutcome, scheduleText, splitInterval, suc
 import type { RoutineRun } from "./types";
 
 const run = (over: Partial<RoutineRun> = {}): RoutineRun => ({
-  task_id: 1, run: 1, title: "R · #1", status: "done", blocker: null, blocker_detail: null,
+  task_id: 1, chat_id: null, run: 1, title: "R · #1", status: "done", blocker: null, blocker_detail: null,
   created_at: "2026-10-07T12:00:00+00:00", started_at: "2026-10-07T12:00:30+00:00",
   done_at: "2026-10-07T12:10:30+00:00", updated_at: "2026-10-07T12:10:30+00:00", archived_at: null,
   report: null, tokens: null, ...over,

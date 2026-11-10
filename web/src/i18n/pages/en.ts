@@ -141,7 +141,7 @@ export const pagesEn = {
     risks: {
       noHuman: {
         title: "No human between the agent and origin",
-        body: "Merge, and push if it's on, follow the report the agent writes itself. `verify_cmd` is the only independent voice.",
+        body: "Merge, and push if it's on, follow the agent's own word that the work is done. `verify_cmd` is the only independent voice.",
       },
       verifyEdited: {
         title: "verify_cmd runs code the agent just edited",
@@ -215,7 +215,7 @@ export const pagesEn = {
         steps: {
           s1: "Name and repository path. A folder without git? orc offers to run `git init` with an empty first commit on main.",
           s2: "«Agents at once» — how many tasks of this project run in parallel. orc settings also have a global cap.",
-          s3: "«How to run agents» — default model, effort and permission mode for new tasks. Each task can override them.",
+          s3: "«Agents» — the project's lead and how many run at once. Model, effort and permission mode are set on each agent; the project's own values (under «Fallback run settings», in project settings) apply only to an agent that sets none.",
           s4: "«Base branch» — where task branches start from and where results merge back. Empty means the branch currently checked out in the repository.",
           s5: "«Pre-merge check» — the verify command (for example, `make test`) and its timeout. This is the main safety gate: without it, the merge trusts only the agent's word.",
           s6: "«After merge» — push to origin. Off by default: orc never pushes on its own until you enable it.",
@@ -231,12 +231,26 @@ export const pagesEn = {
         steps: {
           s1: "Title — a short name for the board.",
           s2: "«Task for the agent» — what to do, where it lives and how to check it. Paste screenshots right where they belong: Ctrl+V, drag-and-drop or the «Image» button. «Text / Preview» shows what the agent will see.",
-          s3: "«Run parameters» — model, effort and permission mode. An empty field takes the project's value and follows it if the project changes.",
+          s3: "«Assignee» — the agent that does the work. The agent carries the model, effort and permission mode; a card with nobody assigned belongs to you and does not go to work.",
           s4: "Permission modes: `auto` — Claude decides itself; `acceptEdits` — edits files without asking; `dontAsk` — never asks, and anything not pre-approved just doesn't run; `bypassPermissions` — no checks at all, only for your own repositories.",
-          s5: "Priority, base branch and «Blocked on tasks»: a dependent task waits until the tasks it depends on are done, even in other projects.",
+          s5: "Priority, base branch and «Waits for»: a card waits until the cards it depends on are merged, even in other projects. «Add property» adds labels and planning dates, which the queue never reads.",
           s6: "Leave the card in «Backlog» as a note, or put it in «To do» — the dispatcher picks it up on the next tick. A card with an empty assignment can't go to «To do».",
         },
         tip: "The base branch can be changed while the card is in «Backlog» or «To do». Once the task starts, the working copy already exists and it's too late.",
+      },
+      card: {
+        title: "The card",
+        where: "Click a card on the board",
+        intro: "A card describes the work once, and everything between you and the agent happens in its conversation. The left column is for reading, the right one for facts.",
+        steps: {
+          s1: "The description stays where it is: a question from the agent never pushes it aside. Click it to edit; the field grows with the text.",
+          s2: "«Relations»: what the card waits for, what comes next, and its subtasks with a done/total ring. «+» creates a subtask with the parent's project, branch and agent; «List / Tree» shows the whole chain around the card.",
+          s3: "«Conversation»: the session's messages and commands, and the stages orc adds — handed in, verification, merge, conflict. The composer under it changes with the state: «Send to agent» while the agent works or waits, «Continue» and «Retry» after a failure, «Rework» when the card is done.",
+          s4: "«Note, hidden from the agent» stays on the card and never reaches the session.",
+          s5: "The right column: status, assignee, priority, branch and the properties you added. «Execution log» lists every run with why it started, how it ended and what it cost, and every check with its output.",
+          s6: "«Details» at the bottom: who created the card, when it started and finished, its branch, its worktree and the command to attach to the session.",
+        },
+        tip: "A card opens at the top, to read the task. It opens at the end of the conversation when it waits for you, and the agent chip in the header takes you there too.",
       },
       dispatcher: {
         title: "What the dispatcher does",
@@ -245,7 +259,7 @@ export const pagesEn = {
         steps: {
           s1: "Takes tasks from «To do» while there are free slots and creates a worktree with branch `orc/task-<id>` from the task's base branch.",
           s2: "Runs `claude --bg` there with your assignment, model and permission mode. The card moves to «In progress».",
-          s3: "When the session finishes, reads `.orchestrator/report.json`. If the agent reports a failure, the task comes back with its explanation.",
+          s3: "Waits for the agent to run `orc task done` and end its turn. If it runs `orc task fail`, the task stops with its reason. If it does neither, the card waits for you. If it runs `orc task wakeup`, the card sleeps without a worker slot until its wakeup.",
           s4: "Runs `verify_cmd` in the worktree — the «verifying» badge. Red: the task goes back to the agent with the check's output.",
           s5: "Green: the task joins the merge queue — the «merging» badge: `--no-ff` into the base branch, one task at a time. Then «Done».",
           s6: "The dispatcher panel shows the heartbeat and busy agents. «Pause» stops dispatching new tasks; «Run now» makes a pass without waiting for the timer.",
@@ -258,10 +272,11 @@ export const pagesEn = {
         intro: "Magenta is the only color in the interface that calls a human. A card that needs you floats to the top of its column and gets a badge.",
         steps: {
           s1: "The agent asked for permission, asked a question or proposed a plan — the card gets «waiting for reply», and the counter in the header grows.",
-          s2: "Open the card: the agent's question is at the top. Answer in «Reply to Claude» — screenshots work here too.",
+          s2: "Open the card. A permission, a choice or a plan arrives as a form at the end of the conversation, in place of the composer. A plain question is the agent's last message, marked «Waiting for your reply»: answer in the composer — screenshots work here too.",
           s3: "The reply goes to the same session within seconds, and it continues where it stopped.",
-          s4: "You can write to a working session without being asked: the «To session» button next to the note field. The text arrives at its next tool call without interrupting it.",
-          s5: "If the session doesn't pick up the message for a few minutes, the card says so and offers «Interrupt session» — then the text is delivered with a restart.",
+          s4: "You can write to a working session without being asked: «Send to agent» in the composer. The text arrives at its next tool call without interrupting it; «Interrupt» stops the current step first, like Esc.",
+          s5: "A message on its way shows its receipt under it: «waiting for the agent's next step», then «read». If the agent is busy with a long step, «Interrupt» stops it, like Esc, so it reads your message sooner.",
+          s6: "The agent hands in its work with `orc task done`. If it stopped without it and the work looks finished, «Accept the work» beside «Send to agent» hands it in for it: the check still runs.",
         },
         tip: "Questions from other projects appear as a separate chip in the same bar — the dispatcher is shared, so nothing gets lost.",
       },
@@ -271,7 +286,7 @@ export const pagesEn = {
         intro: "Most problems resolve without you. Here's what orc does on its own and when it calls you.",
         steps: {
           s1: "Merge conflict: the task that arrives second finds someone else's edits in its files. orc sends the conflict back to the session that wrote the code; it resolves it by meaning, passes the check again and returns to the merge queue. After three attempts — the «conflict» badge.",
-          s2: "A failed task is red, and the reason is in the card. «Retry» starts from scratch; «Resume session» continues the same session.",
+          s2: "A failed task is red, and the reason is in its conversation. «Continue» resumes the same session, with your message if you write one; «Retry» starts from scratch; «Accept the work» sends what the session did to the check.",
           s3: "Quota: when the Claude limit runs out, the task waits with the «quota» badge, and the dispatcher resumes it after the reset.",
           s4: "«not trusted»: Claude Code won't start sessions in a folder you haven't trusted. «Trust folder and start» fixes it once per project.",
           s5: "«dirty copy»: the target branch has an unfinished merge, rebase or cherry-pick. orc won't touch it — finish the operation, and the task continues.",
@@ -366,7 +381,7 @@ export const pagesEn = {
         c1: "There's a free slot — the task is taken from the queue.",
         c2: "A separate worktree and branch are created for it.",
         c3: "`claude --bg` starts with your assignment.",
-        c4: "The session finishes and writes its report.",
+        c4: "The session runs `orc task done` and ends its turn.",
         c5: "`verify_cmd` runs in the task's worktree.",
         c6: "Merge into the base branch, one task at a time.",
       },
@@ -380,8 +395,8 @@ export const pagesEn = {
       captions: {
         c1: "The agent is working.",
         c2: "It has a question: the card turns magenta and floats up.",
-        c3: "You open the card and see the question.",
-        c4: "You reply in «Reply to Claude».",
+        c3: "You open the card: the question is its last message.",
+        c4: "You reply in the composer right below it.",
         c5: "The reply reaches the same session, and the work goes on.",
       },
     },

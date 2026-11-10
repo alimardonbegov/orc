@@ -1,31 +1,15 @@
-import { useEffect, useState } from "react";
-import { GitBranch, RotateCcw } from "lucide-react";
-import { api } from "../api";
-import type { PermissionMode, Priority, Project, Task } from "../types";
-import { priorityLabel } from "../labels";
-import {
-  inheritNote,
-  hasOwnRunParams,
-  inheritedEffort,
-  inheritedModel,
-  inheritedPermission,
-  inheritedVerifyCmd,
-} from "../runParams";
-import { ScheduleField } from "./ScheduleField";
-import { scheduleError, type ScheduleValues } from "../schedule";
-import { useNow } from "../hooks/useNow";
-import { DependsOnPicker } from "./DependsOnPicker";
+import { useEffect, useRef, useState } from "react";
+import { ListTree, PlayCircle, X } from "lucide-react";
+import type { Priority, Project, Task } from "../types";
+import { useAgents } from "../agents";
+import { defaultAgentId, effectiveCardSettings, useAppCardSettings } from "../cardSettings";
+import { BaseMismatchNotice, baseMismatch, useProjectBranches } from "./cardProperties/BranchProperty";
+import { PropertyPills } from "./cardProperties/CardProperties";
 import { DescriptionEditor } from "./DescriptionEditor";
-import { EffortPicker } from "./EffortPicker";
-import { ModelPicker } from "./ModelPicker";
-import { PermissionPicker } from "./PermissionPicker";
 import { Button } from "../ui/Button";
-import { focusRing } from "../ui/tokens";
-import { Field, Input, Select } from "../ui/Field";
-import { cn } from "../lib/cn";
+import { AutoGrowTextarea } from "../ui/Field";
 import { useTranslation } from "../i18n";
-import { effectiveHiddenModels } from "../models";
-import { useAppHiddenModels } from "../hiddenModels";
+import { readLastBranch, writeLastBranch } from "../lastBranch";
 
 export interface TaskFormValues {
   title: string;
@@ -33,240 +17,182 @@ export interface TaskFormValues {
   priority: Priority;
   target_branch: string | null;
   depends_on: number[];
-  model: string | null;
-  effort: string | null;
-  permission_mode: PermissionMode | null;
-  verify_cmd: string | null;
-  /** Deferred start (ISO UTC): not earlier than / not later than. null means immediately / window
-   * open. */
-  start_after: string | null;
-  start_before: string | null;
+  /** Who the card is assigned to. null means a person: the card cannot go to work. */
+  agent_id: number | null;
+  /** Label names; a missing label is created by the server. */
+  labels: string[];
+  /** Planning days, `YYYY-MM-DD`. They are a plan for people: the queue never reads them. */
+  start_date: string | null;
+  due_date: string | null;
+  /** The card this one is a subtask of: grouping only, the queue never reads it. null means top-level. */
+  parent_task_id: number | null;
+  /** backlog waits for a decision, todo goes straight to the queue. */
+  status: "backlog" | "todo";
 }
 
 interface Props {
   projectId: number;
-  /** Task's project: needed to show inherited values in the run parameters. */
   project?: Project | null;
   /** All projects: used to label the repositories of blocker tasks from other projects. */
   projects?: Project[];
   initial?: Partial<TaskFormValues>;
   allTasks: Task[];
-  excludeId?: number;
   onSubmit: (values: TaskFormValues) => void;
   onCancel: () => void;
-  /** While true, the "Save" button is disabled: the request is still in flight (controlled by the
-   * calling component). */
+  /** While true, the buttons are disabled: the request is still in flight. */
   pending?: boolean;
-  /** Label of the main button: "Save" when editing, "Create task" when creating. */
+  /** Label of the main button. */
   submitLabel?: string;
+  /** Open with the branch picked for the previous task of this project and remember the one picked now. */
+  rememberBranch?: boolean;
 }
 
-const empty = (v: string) => (v.trim() === "" ? null : v.trim());
-
 /**
- * Shared create-and-edit form.
+ * Creating a task: what to do, and a row of properties under it.
  *
- * Run parameters are always expanded and stand right under the description, above the blockers.
- * They used to lie in a collapsed spoiler at the very bottom of the form, and getting to a
- * parameter changed in almost every task took two extra actions: scroll down and expand. Blockers,
- * on the contrary, are rarely needed and take up half the form as a list, so they moved down.
+ * Who does it and how it runs is the agent's business: the model, the effort and the mode live in the
+ * agent and in the project, not in every card. Which properties are in the row is a setting, and
+ * the properties themselves are in cardProperties/registry.tsx.
  */
-export function TaskForm({
-  projectId,
-  project,
-  projects,
-  initial,
-  allTasks,
-  excludeId,
-  onSubmit,
-  onCancel,
-  pending = false,
-  submitLabel,
-}: Props) {
+export function TaskForm({ projectId, project, projects, initial, allTasks, onSubmit, onCancel, pending = false, submitLabel, rememberBranch = false }: Props) {
   const { t } = useTranslation();
-  // We take from initial only the form fields: in edit mode the whole task arrives there
+  const agents = useAgents();
+  const settings = effectiveCardSettings(project, useAppCardSettings());
   const [v, setV] = useState<TaskFormValues>(() => ({
     title: initial?.title ?? "",
     description: initial?.description ?? "",
-    priority: initial?.priority ?? "normal",
+    priority: initial?.priority ?? settings.default_priority ?? "normal",
     target_branch: initial?.target_branch ?? null,
     depends_on: initial?.depends_on ?? [],
-    model: initial?.model ?? null,
-    effort: initial?.effort ?? null,
-    permission_mode: initial?.permission_mode ?? null,
-    verify_cmd: initial?.verify_cmd ?? null,
-    start_after: initial?.start_after ?? null,
-    start_before: initial?.start_before ?? null,
+    agent_id: initial?.agent_id ?? defaultAgentId(settings, agents, projectId),
+    labels: initial?.labels ?? [],
+    start_date: initial?.start_date ?? null,
+    due_date: initial?.due_date ?? null,
+    parent_task_id: initial?.parent_task_id ?? null,
+    status: "backlog",
   }));
-  // The schedule the form was opened with: unchanged with an expired end is not an error (see
-  // scheduleError)
-  const [initialSchedule] = useState<ScheduleValues>(() => ({
-    start_after: initial?.start_after ?? null,
-    start_before: initial?.start_before ?? null,
-  }));
-  const now = useNow();
-  const scheduleErr = scheduleError(v, now, initialSchedule);
-  const [branches, setBranches] = useState<string[]>([]);
 
+  // The agent list arrives with a poll and may come after the form opened. The default is applied then,
+  // but only until the person has picked, or "Unassigned" would be overwritten.
+  const touchedAgent = useRef(initial?.agent_id !== undefined);
+  const fallbackAgent = defaultAgentId(settings, agents, projectId);
   useEffect(() => {
-    api
-      .branches(projectId)
-      .then((b) => {
-        setBranches(b.branches);
-        // The default branch is the project base: the "Base branch for new tasks" setting, and if
-        // it is not set, the one currently checked out in the repository.
-        setV((s) => ({ ...s, target_branch: s.target_branch ?? b.base }));
-      })
-      .catch(() => setBranches([]));
-  }, [projectId]);
+    if (!touchedAgent.current && fallbackAgent !== null) setV((s) => (s.agent_id === null ? { ...s, agent_id: fallbackAgent } : s));
+  }, [fallbackAgent]);
 
-  // allTasks receives tasks of all projects (App does not filter them), and that is intended: a
-  // blocker can be a task from another repository. Which of them to show is decided by
-  // DependsOnPicker: the own project right away, others as separate groups on a button.
-  const candidates = allTasks.filter((t) => t.id !== excludeId);
+  // The default is the branch of the previous task (if it still exists), otherwise the project base:
+  // the "Base branch for new tasks" setting, and if it is not set, the one checked out in the repository.
+  const branches = useProjectBranches(projectId, true, ({ branches: list, base }) => {
+    const last = rememberBranch ? readLastBranch(projectId) : null;
+    const fallback = last && list.includes(last) ? last : base;
+    setV((s) => ({ ...s, target_branch: s.target_branch ?? fallback }));
+  });
 
-  // Labels of empty options: they hold the inherited value, with a note in parentheses that it came
-  // from the project (see runParams.ts).
-  const model = inheritedModel(t, project);
-  const effort = inheritedEffort(t, project);
-  const permission = inheritedPermission(t, project);
-  const verifyCmd = inheritedVerifyCmd(t, project);
-  const own = hasOwnRunParams(v);
-  const hiddenModels = effectiveHiddenModels(project, useAppHiddenModels());
+  const mismatch = baseMismatch(allTasks, v.depends_on, projectId, v.target_branch);
+  const hasTitle = v.title.trim() !== "";
+  const canStart = hasTitle && v.agent_id !== null && v.description.trim() !== "";
+
+  function submit(status: TaskFormValues["status"]) {
+    if (!hasTitle || pending) return;
+    if (rememberBranch) writeLastBranch(projectId, v.target_branch);
+    onSubmit({ ...v, status, title: v.title.trim() });
+  }
 
   return (
     <form
-      className="space-y-4"
+      className="space-y-3"
       onSubmit={(e) => {
         e.preventDefault();
-        if (v.title.trim() && !pending && !scheduleErr) onSubmit({ ...v, title: v.title.trim() });
+        submit("backlog");
       }}
     >
-      <Field label={t("taskForm.titleLabel")}>
-        <Input placeholder={t("taskForm.titlePlaceholder")} value={v.title} onChange={(e) => setV({ ...v, title: e.target.value })} autoFocus />
-      </Field>
-
-      <Field label={t("taskForm.descriptionLabel")} hint={t("taskForm.descriptionHint")}>
-        <DescriptionEditor
-          label={t("taskForm.descriptionLabel")}
-          placeholder={t("taskForm.descriptionPlaceholder")}
-          value={v.description}
-          onChange={(description) => setV({ ...v, description })}
-        />
-      </Field>
-
-      <section className="space-y-2.5 rounded-[var(--radius-sm)] border border-[var(--line)] px-3 py-2.5">
-        <div className="flex items-center gap-2">
-          <h3 className="text-[12px] font-semibold text-[var(--ink-muted)]">{t("taskForm.runParamsHeading")}</h3>
-          {/* There is no other way to return a field to inheritance: the empty option comes
-             first in the list, but finding it in each of the four fields is a separate chore. */}
-          {own && (
-            <button
-              type="button"
-              className={cn(
-                "ml-auto flex items-center gap-1 rounded-[var(--radius-sm)] px-1.5 py-0.5 text-[11px] text-[var(--ink-faint)] transition-colors hover:text-[var(--ink)]",
-                focusRing,
-              )}
-              onClick={() => setV({ ...v, model: null, effort: null, permission_mode: null, verify_cmd: null })}
-            >
-              <RotateCcw size={11} aria-hidden />
-              {t("taskForm.resetToProject")}
-            </button>
-          )}
-        </div>
-
-        {/* Three columns, not two: this way the whole block is two rows of fields, and the
-           description above stays on screen together with the parameters. */}
-        <div className="grid grid-cols-2 gap-x-3 gap-y-2.5 sm:grid-cols-3">
-          <ModelPicker
-            value={v.model}
-            defaultLabel={model}
-            hidden={hiddenModels}
-            onChange={(next) => setV({ ...v, model: next })}
-          />
-          <EffortPicker value={v.effort} defaultLabel={effort} onChange={(next) => setV({ ...v, effort: next })} />
-          <PermissionPicker
-            value={v.permission_mode}
-            defaultLabel={permission}
-            onChange={(next) => setV({ ...v, permission_mode: next })}
-          />
-          <Field label={t("taskForm.priorityLabel")}>
-            <Select
-              aria-label={t("taskForm.priorityLabel")}
-              value={v.priority}
-              onChange={(e) => setV({ ...v, priority: e.target.value as Priority })}
-            >
-              {(["high", "normal", "low"] as Priority[]).map((p) => (
-                <option key={p} value={p}>
-                  {priorityLabel(t, p)}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field label={t("taskForm.baseBranchLabel")}>
-            <Select
-              aria-label={t("taskForm.baseBranchLabel")}
-              title={t("taskForm.baseBranchTitle")}
-              className="font-mono"
-              value={v.target_branch ?? ""}
-              onChange={(e) => setV({ ...v, target_branch: e.target.value || null })}
-            >
-              {/* The branch could have been deleted behind the dashboard's back. Silently
-                 replacing it with the first in the list is not allowed: the task would go off
-                 to be merged to the wrong place, which nobody would learn about. */}
-              {v.target_branch && !branches.includes(v.target_branch) && (
-                <option value={v.target_branch}>{t("taskForm.branchGone", { branch: v.target_branch })}</option>
-              )}
-              {branches.map((b) => (
-                <option key={b} value={b}>
-                  {b}
-                </option>
-              ))}
-            </Select>
-          </Field>
-          <Field label={t("taskForm.verifyCmdLabel")}>
-            <Input
-              className="font-mono"
-              placeholder={verifyCmd}
-              value={v.verify_cmd ?? ""}
-              onChange={(e) => setV({ ...v, verify_cmd: empty(e.target.value) })}
-            />
-          </Field>
-        </div>
-
-        {project && <p className="text-[11px] leading-snug text-[var(--ink-faint)]">{inheritNote(t)}</p>}
-      </section>
-
-      <ScheduleField
-        value={{ start_after: v.start_after, start_before: v.start_before }}
-        onChange={(s) => setV({ ...v, ...s })}
-        error={scheduleErr}
+      <AutoGrowTextarea
+        aria-label={t("taskForm.titleLabel")}
+        className="min-h-9 border-transparent bg-transparent px-0 py-[7px] text-[15px] font-semibold leading-snug hover:border-transparent focus:border-transparent focus:ring-0"
+        placeholder={t("taskForm.titlePlaceholder")}
+        value={v.title}
+        // A long title wraps instead of running off the edge, and stays one paragraph
+        onChange={(e) => setV({ ...v, title: e.target.value.replace(/\s*\n\s*/g, " ") })}
+        onKeyDown={(e) => {
+          // A one-line field submitted the form on Enter; a textarea would add a line instead
+          if (e.key === "Enter" && !e.nativeEvent.isComposing) {
+            e.preventDefault();
+            e.currentTarget.form?.requestSubmit();
+          }
+        }}
+        autoFocus
       />
 
-      <DependsOnPicker
-        candidates={candidates}
+      <DescriptionEditor
+        label={t("taskForm.descriptionLabel")}
+        placeholder={t("taskForm.descriptionPlaceholder")}
+        value={v.description}
+        onChange={(description) => setV({ ...v, description })}
+      />
+
+      {v.parent_task_id !== null && (
+        <ParentPill parentId={v.parent_task_id} title={allTasks.find((t) => t.id === v.parent_task_id)?.title} onRemove={() => setV({ ...v, parent_task_id: null })} />
+      )}
+
+      <PropertyPills
+        settings={settings}
+        values={v}
+        onChange={(patch) => {
+          if ("agent_id" in patch) touchedAgent.current = true;
+          setV({ ...v, ...patch });
+        }}
         projectId={projectId}
         projects={projects}
-        value={v.depends_on}
-        onChange={(ids) => setV({ ...v, depends_on: ids })}
+        allTasks={allTasks}
+        branches={branches}
       />
 
-      {/* The buttons stick to the bottom of the scrollable area: in a long form one would
-         otherwise have to scroll to them, and this is the window's main action. */}
-      <div className="sticky bottom-0 -mx-5 -mb-4 flex items-center justify-end gap-2 border-t border-[var(--line)] bg-[var(--surface)] px-5 py-3">
-        {v.target_branch && (
-          <span className="mr-auto flex items-center gap-1 font-mono text-[11px] text-[var(--ink-faint)]">
-            <GitBranch size={11} aria-hidden />
-            {v.target_branch}
-          </span>
-        )}
+      {v.target_branch && mismatch.length > 0 && (
+        <BaseMismatchNotice branches={mismatch} branch={v.target_branch} onFix={(target_branch) => setV({ ...v, target_branch })} />
+      )}
+
+      {/* The buttons stick to the bottom of the scrollable area: this is the window's main action. */}
+      <div className="sticky -bottom-4 -mx-5 -mb-4 flex flex-wrap items-center justify-end gap-2 border-t border-[var(--line)] bg-[var(--surface)] px-5 py-3">
         <Button type="button" variant="ghost" onClick={onCancel}>
           {t("common.cancel")}
         </Button>
-        <Button type="submit" variant="primary" loading={pending} disabled={!v.title.trim() || scheduleErr !== null}>
+        <Button type="submit" loading={pending} disabled={!hasTitle}>
           {submitLabel ?? t("taskForm.save")}
+        </Button>
+        <Button
+          type="button"
+          variant="primary"
+          icon={PlayCircle}
+          disabled={!canStart || pending}
+          title={canStart ? undefined : t("card.form.startNeeds")}
+          onClick={() => submit("todo")}
+        >
+          {t("card.form.createAndStart")}
         </Button>
       </div>
     </form>
+  );
+}
+
+/** The parent a subtask was opened from: named, and removable for a card that should stand on its own after all. */
+function ParentPill({ parentId, title, onRemove }: { parentId: number; title?: string; onRemove: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <div className="flex items-center gap-1.5 text-[12px] text-[var(--ink-muted)]">
+      <span className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-[var(--line)] py-0.5 pl-2 pr-0.5">
+        <ListTree size={12} aria-hidden className="shrink-0 text-[var(--ink-faint)]" />
+        <span className="shrink-0">{t("card.relations.formParent", { id: parentId })}</span>
+        {title && <span className="truncate text-[var(--ink-faint)]">{title}</span>}
+        <button
+          type="button"
+          aria-label={t("card.relations.formParentRemove")}
+          title={t("card.relations.formParentRemove")}
+          onClick={onRemove}
+          className="inline-flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[var(--ink-faint)] hover:bg-[var(--sunken)] hover:text-[var(--ink)]"
+        >
+          <X size={12} aria-hidden />
+        </button>
+      </span>
+    </div>
   );
 }

@@ -1,4 +1,4 @@
-import type { Analytics, Attachment, Forecast, Routine, RoutineInput, RoutineRun, SchedulePreview, BranchesView, WorktreesView, ClaudeMd, ClaudeMdFile, ClaudeMdLocation, Comment, DispatcherStatus, InputDecision, OrcEvent, Project, ProjectMoveResult, ProjectPathCheck, Settings, Task, TaskDetail, UsageStatus } from "./types";
+import type { BoardFilters, BoardView, BulkBody, BulkResult, CardDraft, ActivityPage, Agent, AgentInput, AgentsActivity, AgentWork, AgentMemory, Chat, ChatDetail, ChatMessage, Analytics, Attachment, Forecast, Routine, RoutineInput, RoutineRun, SchedulePreview, BranchesView, WorktreesView, ClaudeMd, ClaudeMdFile, ClaudeMdLocation, Comment, Deliverable, DispatcherStatus, ExecutionLog, InputDecision, Label, OrcEvent, OsProcesses, Project, ProjectMoveResult, ProjectPathCheck, Settings, Task, TaskDetail, UsageStatus, Wakeup } from "./types";
 
 export class ApiError extends Error {
   status: number;
@@ -59,6 +59,16 @@ function query(params: Record<string, string | number | undefined>): string {
   return q ? `?${q}` : "";
 }
 
+export type ActivityQuery = {
+  cursor?: string;
+  before?: string;
+  /** Read the steps of this subagent instead of the main session. */
+  agent?: string;
+};
+
+/** What a request may set on a card: the labels go out as names, not as the objects the card comes back with. */
+export type TaskBody = Omit<Partial<Task>, "labels"> & { labels?: string[] };
+
 export const api = {
   // archived: hide (the server default) | only | all. The dashboard uses all: it needs archived
   // projects in the same response to show them as a separate sidebar section.
@@ -112,11 +122,30 @@ export const api = {
   listTasks: (params: { project_id?: number; status?: string; archived?: "hide" | "only" | "all" } = {}) =>
     get<Task[]>(`/api/tasks${query(params)}`),
   getTask: (id: number) => get<TaskDetail>(`/api/tasks/${id}`),
-  addTask: (body: Partial<Task> & { project_id: number; title: string }) => post<TaskDetail>("/api/tasks", body),
+  // The card's execution log: runs with their trigger, outcome and cost, checks with their output, merges.
+  taskRuns: (id: number) => get<ExecutionLog>(`/api/tasks/${id}/runs`),
+  // A cheap model writes the card from the owner's words; nothing is created until the form is submitted.
+  draftTask: (project_id: number, text: string) => post<CardDraft>("/api/tasks/draft", { project_id, text }),
+  taskWakeups: (id: number) => get<Wakeup[]>(`/api/tasks/${id}/wakeups`),
+  cancelWakeup: (taskId: number, wakeupId: number) => post<Wakeup>(`/api/tasks/${taskId}/wakeups/${wakeupId}/cancel`, {}),
+  addTask: (body: TaskBody & { project_id: number; title: string }) => post<TaskDetail>("/api/tasks", body),
   // force=true confirms the emergency close of a stuck task (see FORCE_MOVES in orc/api.py). This
   // is not a task field: it is not written to the database, it only permits the transition.
-  patchTask: (id: number, body: Partial<Task> & { status?: string; blocker?: null; force?: boolean }) =>
+  patchTask: (id: number, body: TaskBody & { status?: string; blocker?: null; force?: boolean }) =>
     patch<TaskDetail>(`/api/tasks/${id}`, body),
+  // One change for several cards; the answer has a result for every card, a refusal of one is not an error
+  bulkTasks: (body: BulkBody) => post<BulkResult>("/api/tasks/bulk", body),
+  // Saved board views: per project, on the server
+  listViews: (projectId: number) => get<BoardView[]>(`/api/projects/${projectId}/views`),
+  addView: (projectId: number, name: string, filters: BoardFilters) =>
+    post<BoardView>(`/api/projects/${projectId}/views`, { name, filters }),
+  updateView: (id: number, body: { name?: string; filters?: BoardFilters }) => patch<BoardView>(`/api/views/${id}`, body),
+  deleteView: (id: number) => del<{ deleted: number }>(`/api/views/${id}`),
+  // Labels are global. A card takes label NAMES, and a missing one is created on the spot.
+  listLabels: () => get<Label[]>("/api/labels"),
+  addLabel: (name: string, color?: string) => post<Label>("/api/labels", { name, ...(color ? { color } : {}) }),
+  patchLabel: (id: number, body: { name?: string; color?: string }) => patch<Label>(`/api/labels/${id}`, body),
+  deleteLabel: (id: number) => del<{ deleted: number }>(`/api/labels/${id}`),
   addComment: (id: number, body: string, kind: Comment["kind"], mode?: "soft" | "interrupt") =>
     post<TaskDetail>(`/api/tasks/${id}/comments`, { body, kind, ...(mode ? { mode } : {}) }),
   // Decision on an input request (permission, answer to a question, plan approval). The session is
@@ -127,7 +156,19 @@ export const api = {
   // The backend returns asdict(task) without depends_on (see orc/api.py:288, 296): the type must
   // not lie about this field.
   retry: (id: number) => post<Omit<Task, "depends_on">>(`/api/tasks/${id}/retry`),
-  resume: (id: number) => post<Omit<Task, "depends_on">>(`/api/tasks/${id}/resume`),
+  // message goes into the session instead of the routine "continue from where you left off".
+  resume: (id: number, message?: string) =>
+    post<Omit<Task, "depends_on">>(`/api/tasks/${id}/resume`, message ? { message } : undefined),
+  // Stop the agent right now: the task moves to failed and waits, its work stays (orc/dispatcher.py:stop_session).
+  stopTask: (id: number) => post<TaskDetail>(`/api/tasks/${id}/stop`),
+  // The owner takes the work as handed in, for an agent waiting on a reply or one that failed: it goes to verification.
+  acceptTask: (id: number) => post<TaskDetail>(`/api/tasks/${id}/accept`),
+  // Esc in the session: the current step stops, the session and the task stay.
+  interruptTask: (id: number) => post<TaskDetail>(`/api/tasks/${id}/interrupt`),
+  taskActivity: (id: number, params: ActivityQuery = {}) => get<ActivityPage>(`/api/tasks/${id}/activity${query(params)}`),
+  taskActivityResult: (id: number, session: number, offset: number, toolUseId: string, agent?: string) =>
+    get<{ text: string }>(`/api/tasks/${id}/activity/result${query({ session, offset, tool_use_id: toolUseId, agent })}`),
+  taskProcesses: (id: number) => get<OsProcesses>(`/api/tasks/${id}/processes`),
   // Explicit trust in the project folder (untrusted blocker) and rerunning the task, instead of
   // going to the terminal to accept Claude Code's trust dialog by hand.
   trustAndRetry: (id: number) => post<Omit<Task, "depends_on">>(`/api/tasks/${id}/trust`),
@@ -151,20 +192,60 @@ export const api = {
   uploadAttachment: (body: { filename: string; mime: string; data: string }) =>
     post<Attachment>("/api/attachments", body),
 
+  // Files an agent handed in as the card's result (orc/api/deliverables.py)
+  taskDeliverables: (id: number) => get<Deliverable[]>(`/api/tasks/${id}/deliverables`),
+
   // Recurring tasks (orc/api/routines.py): a template and a schedule; each run is an ordinary task.
   routines: (projectId?: number) => get<Routine[]>(`/api/routines${query({ project_id: projectId })}`),
-  addRoutine: (body: RoutineInput & { project_id: number; enabled?: boolean }) => post<Routine>("/api/routines", body),
-  patchRoutine: (id: number, body: Partial<RoutineInput> & { enabled?: boolean }) => patch<Routine>(`/api/routines/${id}`, body),
+  addRoutine: (body: RoutineInput & { project_id: number | null; enabled?: boolean }) => post<Routine>("/api/routines", body),
+  patchRoutine: (id: number, body: Partial<RoutineInput> & { enabled?: boolean; project_id?: number | null }) => patch<Routine>(`/api/routines/${id}`, body),
   // Routine runs stay on the board as ordinary tasks: only the schedule is deleted.
   deleteRoutine: (id: number) => del<{ deleted: number }>(`/api/routines/${id}`),
   // "Run now": an out-of-schedule run, the schedule does not shift. 409 means the previous run is
   // still going.
-  runRoutine: (id: number) => post<{ task_id: number; routine: Routine }>(`/api/routines/${id}/run`),
+  runRoutine: (id: number) => post<{ task_id: number | null; chat_id: number | null; routine: Routine }>(`/api/routines/${id}/run`),
   routineRuns: (id: number) => get<RoutineRun[]>(`/api/routines/${id}/runs`),
   // Schedule check before saving: the server computes the nearest runs with the same code as the
   // dispatcher.
   previewSchedule: (body: Pick<RoutineInput, "schedule_kind" | "interval_minutes" | "cron" | "timezone">) =>
     post<SchedulePreview>("/api/routines/preview", body),
+
+  // Agents (orc/api/agents.py): pre-configured executors for tasks, routines and chats.
+  agents: () => get<Agent[]>("/api/agents"),
+  addAgent: (body: AgentInput) => post<Agent>("/api/agents", body),
+  patchAgent: (id: number, body: Partial<AgentInput>) => patch<Agent>(`/api/agents/${id}`, body),
+  // 409 while tasks or routines still depend on the agent: they must not fall back silently.
+  deleteAgent: (id: number) => del<{ deleted: number }>(`/api/agents/${id}`),
+  agentMemory: (id: number) => get<AgentMemory>(`/api/agents/${id}/memory`),
+  clearAgentMemory: (id: number) => del<{ files: [] }>(`/api/agents/${id}/memory`),
+
+  // A decision on what the chat's session waits for goes to its hook.
+  answerChatInput: (chatId: number, messageId: number, decision: InputDecision) =>
+    post<ChatMessage>(`/api/chats/${chatId}/input-requests/${messageId}/answer`, { decision }),
+  // Direct chats (orc/api/chats.py). A message only queues up: the chat loop starts the turn.
+  chats: () => get<Chat[]>("/api/chats"),
+  chat: (id: number) => get<ChatDetail>(`/api/chats/${id}`),
+  addChat: (body: { agent_id: number; project_id: number | null }) => post<Chat>("/api/chats", body),
+  renameChat: (id: number, title: string) => patch<Chat>(`/api/chats/${id}`, { title }),
+  // Pin or archive without touching the conversation; neither moves the chat in the list.
+  updateChat: (id: number, body: { pinned?: boolean; archived?: boolean }) => patch<Chat>(`/api/chats/${id}`, body),
+  markChatUnread: (id: number) => post<Chat>(`/api/chats/${id}/unread`),
+  markAllChatsRead: () => post<{ chats: number }>("/api/chats/read-all"),
+  deleteChat: (id: number) => del<{ deleted: number }>(`/api/chats/${id}`),
+  sendChatMessage: (id: number, body: string) => post<ChatMessage>(`/api/chats/${id}/messages`, { body }),
+  stopChat: (id: number) => post<Chat>(`/api/chats/${id}/stop`),
+  chatActivity: (id: number, params: ActivityQuery = {}) => get<ActivityPage>(`/api/chats/${id}/activity${query(params)}`),
+  chatActivityResult: (id: number, session: number, offset: number, toolUseId: string, agent?: string) =>
+    get<{ text: string }>(`/api/chats/${id}/activity/result${query({ session, offset, tool_use_id: toolUseId, agent })}`),
+  chatProcesses: (id: number) => get<OsProcesses>(`/api/chats/${id}/processes`),
+  // Who is working on what right now, for the agents page.
+  agentsActivity: () => get<AgentsActivity>("/api/agents/activity"),
+  // One agent's totals, spending and history of runs, for its own page.
+  agentWork: (id: number, limit: number) => get<AgentWork>(`/api/agents/${id}/work?limit=${limit}`),
+  // Without messageId everything the chat holds now counts as read.
+  markChatRead: (id: number, messageId?: number) => post<{ last_read_message_id: number }>(`/api/chats/${id}/read`, { message_id: messageId ?? null }),
+  acceptProposal: (chatId: number, messageId: number) => post<{ task_id: number }>(`/api/chats/${chatId}/proposals/${messageId}/accept`),
+  dismissProposal: (chatId: number, messageId: number) => post<{ ok: boolean }>(`/api/chats/${chatId}/proposals/${messageId}/dismiss`),
 
   events: (unread = false) => get<OrcEvent[]>(`/api/events${query({ unread: unread ? 1 : undefined })}`),
   markEventsRead: () => post<{ ok: boolean }>("/api/events/read"),

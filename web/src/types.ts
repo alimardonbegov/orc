@@ -1,6 +1,8 @@
+import type { CardSettings } from "./cardSettings";
+
 export type TaskStatus = "backlog" | "todo" | "in_progress" | "verifying" | "merging" | "done" | "failed";
 export type Priority = "high" | "normal" | "low";
-export type Blocker = "needs_input" | "conflict" | "dirty_copy" | "quota" | "untrusted" | null;
+export type Blocker = "needs_input" | "conflict" | "dirty_copy" | "quota" | "untrusted" | "sleeping" | null;
 /** Delivery state of a message to the task session: a badge on the card. */
 export type OutboxState = "queued" | "sent" | "stopping" | "stalled";
 
@@ -33,6 +35,10 @@ export interface Project {
   /** Viewing results (viewing.ts): finished tasks of the project wait for the owner's glance.
    *  0 — the project does not take part. The field may not come from an old server — then there are no marks. */
   track_viewed?: number;
+  /** The project's lead agent (orc/agents.py). null — no lead. */
+  lead_agent_id?: number | null;
+  /** What this project's cards show and start with (cardSettings.ts). null — as in orc settings. */
+  card_settings?: CardSettings | null;
 }
 
 /**
@@ -118,7 +124,7 @@ export interface WorktreeInfo {
   name: string;
   path: string;
   /** task — a task's worktree, merge — a temporary merge worktree, foreign — not the orchestrator's (a Claude Code session, by hand). */
-  kind: "task" | "merge" | "foreign";
+  kind: "task" | "merge" | "chat" | "foreign";
   branch: string | null;
   head: string | null;
   /** git knows about this worktree. false — just a folder left on disk. */
@@ -187,6 +193,55 @@ export interface ClaudeMd {
   files: ClaudeMdFile[];
 }
 
+/** A label: global across projects, the name is unique ignoring case. */
+export interface Label {
+  id: number;
+  name: string;
+  /** `#rrggbb` */
+  color: string;
+  /** How many cards carry it; only the label list has it. */
+  task_count?: number;
+}
+
+/** The filters the board header holds, as a saved view keeps them (orc/board_views.py). */
+export interface BoardFilters {
+  search: string;
+  attention_only: boolean;
+  label_id: number | null;
+  show_done: boolean;
+  show_archived: boolean;
+  done_sort: "recent" | "oldest" | "failed";
+}
+
+/** A named set of board filters, kept on the server per project. */
+export interface BoardView {
+  id: number;
+  project_id: number;
+  name: string;
+  filters: BoardFilters;
+  created_at: string;
+}
+
+/** One change for several cards (POST /api/tasks/bulk): exactly one change per request. */
+export interface BulkBody {
+  task_ids: number[];
+  status?: "backlog" | "todo";
+  priority?: Priority;
+  /** null takes the agent off */
+  agent_id?: number | null;
+  add_labels?: string[];
+  remove_labels?: string[];
+  /** true archives, false brings back */
+  archived?: boolean;
+}
+
+/** What the server did with each card of a bulk change. */
+export interface BulkResult {
+  results: { id: number; ok: boolean; error?: string; status?: TaskStatus; agent_id?: number | null }[];
+  ok: number;
+  failed: number;
+}
+
 export interface Task {
   id: number;
   project_id: number;
@@ -196,10 +251,9 @@ export interface Task {
   priority: Priority;
   blocker: Blocker;
   blocker_detail: string | null;
+  /** Why blocker_detail says what it says (failures.ts); absent on an older server and on older cards. */
+  detail_code?: string | null;
   target_branch: string | null;
-  model: string | null;
-  effort: string | null;
-  permission_mode: PermissionMode | null;
   verify_cmd: string | null;
   requires_review: number;
   worktree_path: string | null;
@@ -238,6 +292,25 @@ export interface Task {
    *  null — a regular task. The fields may not come from an old server. */
   routine_id?: number | null;
   routine_run?: number | null;
+  /** The agent the task is allocated to. null — the project's parameters. */
+  agent_id?: number | null;
+  /** The card whose session created this one; null means a person or a tool outside a card. */
+  created_by_task_id?: number | null;
+  /** The card this one is a subtask of: grouping only, the queue never reads it (relations.ts). null means top-level.
+   *  The field may not come from an old server. */
+  parent_task_id?: number | null;
+  /** Wake the card when its subtasks are done: 1 yes, 0 no, null follows the project (orc/child_wake.py). */
+  wake_on_children?: number | null;
+  /** The stage among the subtasks of the parent: a stage starts when the previous one is done (orc/stages.py). null means
+   *  none. The field may not come from an old server. */
+  stage?: number | null;
+  /** The cards of the previous stage that hold this one, derived by the server: the same answer the dispatcher uses. */
+  stage_blocked_by?: number[];
+  /** Planning days, `YYYY-MM-DD`: a plan for people, the dispatcher does not read them. The fields may not
+   *  come from an old server. */
+  start_date?: string | null;
+  due_date?: string | null;
+  labels?: Label[];
   depends_on: number[];
   /** An open input request from the session: permission, question, plan. null — the agent is waiting for nothing
    *  (or waits via a fallback channel — then only blocker/blocker_detail exist). The field may
@@ -334,7 +407,7 @@ export interface Comment {
   id: number;
   task_id: number;
   author: "user" | "orc" | "claude";
-  kind: "comment" | "answer" | "rework" | "report";
+  kind: "comment" | "answer" | "rework" | "report" | "subtasks_done";
   body: string;
   created_at: string;
 }
@@ -342,6 +415,75 @@ export interface Comment {
 export interface TaskDetail extends Task {
   comments: Comment[];
   outbox: OutboxMessage[];
+}
+
+/** Why a run of the card's session started (orc/sessions.py, TRIGGERS). null: a run from before the log. */
+export type RunTrigger = "start" | "rework" | "resume" | "crash" | "quota" | "verify_failed" | "conflict" | "message" | "subtasks_done" | "wakeup";
+/** How a run ended (orc/sessions.py, OUTCOMES). null: still going, or nothing recorded it. */
+export type RunOutcome = "handed_in" | "failed" | "stopped" | "quota" | "superseded" | "sleeping";
+
+/** One Claude Code job of a task, with what it cost: the spending log's increments while it was the latest run. */
+export interface TaskRun {
+  id: number;
+  job_id: string;
+  trigger: RunTrigger | null;
+  /** What exactly started it when the trigger alone does not say: for a wakeup, which condition held. */
+  trigger_detail?: string | null;
+  agent_id: number | null;
+  started_at: string;
+  ended_at: string | null;
+  outcome: RunOutcome | null;
+  active: boolean;
+  duration_sec: number | null;
+  cost_usd: number;
+  tokens: number;
+}
+
+/** One verification of the handed-in work, with the end of its output. */
+export interface TaskCheck {
+  id: number;
+  job_id: string | null;
+  cmd: string;
+  ok: boolean;
+  duration_sec: number;
+  output_tail: string;
+  /** The process exit code; null for a timeout and for checks recorded before the code was kept. */
+  exit_code: number | null;
+  timed_out: boolean;
+  created_at: string;
+}
+
+/** A merge attempt, read from the merge queue's events. */
+export interface TaskMerge {
+  id: number;
+  at: string;
+  result: "merged" | "failed" | "conflict";
+  target: string | null;
+  detail: string | null;
+}
+
+/** A wakeup the card's session asked for (orc/wakeups.py): a time, another card, or a card with a deadline. */
+export interface Wakeup {
+  id: number;
+  task_id: number;
+  kind: "at" | "task";
+  /** ISO UTC: the time, or the deadline of a card wakeup. */
+  wake_at: string | null;
+  watch_task_id: number | null;
+  note: string;
+  state: "pending" | "fired" | "cancelled";
+  /** Why it fired or was cancelled, in the server's words. */
+  reason: string | null;
+  created_at: string;
+  ended_at: string | null;
+}
+
+/** GET /tasks/{id}/runs: the card's accounting (orc/runs.py). */
+export interface ExecutionLog {
+  runs: TaskRun[];
+  checks: TaskCheck[];
+  merges: TaskMerge[];
+  totals: { cost_usd: number; tokens: number; agent_sec: number };
 }
 
 /** An image uploaded to the orchestrator. The task text refers to it with the marker orc-image:<id>. */
@@ -353,6 +495,26 @@ export interface Attachment {
   rel_path: string;
   created_at: string;
   url: string;
+}
+
+/** One version of a file an agent handed in as a card's result. */
+export interface DeliverableVersion {
+  id: number;
+  name: string;
+  version: number;
+  size: number;
+  created_at: string;
+  mime: string;
+  /** Only images and plain text may be shown in the page; everything else is a download. */
+  inline: boolean;
+  url: string;
+}
+
+/** A handed-in file by name: the newest version and all of them, newest first. */
+export interface Deliverable {
+  name: string;
+  latest: DeliverableVersion;
+  versions: DeliverableVersion[];
 }
 
 export type EventLevel = "info" | "warn" | "error" | "success";
@@ -432,9 +594,13 @@ export interface UsageStatus {
 export type UsageWindowKey = "five_hour" | "seven_day";
 
 export interface Settings {
+  /** What task cards show and start with: a JSON object (cardSettings.ts). */
+  card_settings: string;
   global_max_workers: string;
   poll_interval_sec: string;
   prompt_template: string;
+  /** Read-only: the built-in template, for the reset when a kept one still orders report.json. */
+  prompt_template_default: string;
   quota_patterns: string;
   /** "1" — the session of the task itself merges a conflict with the target branch, "0" — call a human right away. */
   conflict_autoresolve: string;
@@ -447,6 +613,22 @@ export interface Settings {
   worktree_retention_days: string;
   /** JSON list of model ids hidden from dropdowns in all projects without their own list. */
   hidden_models: string;
+  /** The model that drafts a card from the owner's words: a cheap one. */
+  quick_create_model: string;
+}
+
+/** A card drafted by a model from a phrase: values for the creation form, nothing is stored. */
+export interface CardDraft {
+  draft: {
+    title: string;
+    description: string;
+    priority: Priority;
+    /** null: the model picked none, the form's default applies. */
+    agent_id: number | null;
+    target_branch: string | null;
+  };
+  warnings: string[];
+  usage: { model: string; tokens: number; cost_usd: number };
 }
 
 // ── Dashboard ────────────────────────────────────────────────────────────
@@ -664,7 +846,7 @@ export interface Forecast {
 /** Kind of a recurring task's schedule: every N minutes or a cron expression. */
 export type RoutineScheduleKind = "interval" | "cron";
 
-/** Outcome of a run's report.json — as the agent wrote it. */
+/** What a run handed in (tasks.report_json, orc/handoff.py). */
 export interface RunReport {
   status?: string;
   summary?: string;
@@ -673,7 +855,9 @@ export interface RunReport {
 
 /** One routine run in its history (orc/api/routines.py, _run_out). */
 export interface RoutineRun {
-  task_id: number;
+  /** The run's card; null for a routine outside a project, whose run is a chat. */
+  task_id: number | null;
+  chat_id: number | null;
   run: number | null;
   title: string;
   status: TaskStatus;
@@ -694,15 +878,15 @@ export interface RoutineRun {
  */
 export interface Routine {
   id: number;
-  project_id: number;
+  /** null — a routine outside any project: each run is a chat with its agent. */
+  project_id: number | null;
   title: string;
   description: string;
   priority: Priority;
-  model: string | null;
-  effort: string | null;
-  permission_mode: PermissionMode | null;
   verify_cmd: string | null;
   target_branch: string | null;
+  /** The agent every run is allocated to. */
+  agent_id?: number | null;
   schedule_kind: RoutineScheduleKind;
   interval_minutes: number | null;
   cron: string | null;
@@ -731,10 +915,8 @@ export interface RoutineInput {
   title: string;
   description: string;
   priority: Priority;
-  model: string | null;
-  effort: string | null;
-  permission_mode: PermissionMode | null;
   verify_cmd: string | null;
+  agent_id?: number | null;
   schedule_kind: RoutineScheduleKind;
   interval_minutes: number | null;
   cron: string | null;
@@ -747,4 +929,285 @@ export interface RoutineInput {
 export interface SchedulePreview {
   next: string[];
   text: string;
+}
+
+/** A pre-configured executor (orc/agents.py). Empty run parameters are inherited from the project. */
+export interface Agent {
+  id: number;
+  name: string;
+  description: string;
+  /** A small data:image URL or a short glyph. null — initials. */
+  avatar: string | null;
+  model: string | null;
+  effort: string | null;
+  permission_mode: PermissionMode | null;
+  prompt: string;
+  /** null — available everywhere; otherwise internal to this project. */
+  project_id: number | null;
+  /** The agent keeps its own memory directory across projects. */
+  memory_enabled: boolean;
+  /** The projects this agent leads: the other side of Project.lead_agent_id. */
+  lead_project_ids?: number[];
+  created_at: string;
+  updated_at: string;
+  tasks: { active: number; total: number };
+}
+
+export type AgentInput = Pick<Agent, "name" | "description" | "avatar" | "model" | "effort" | "permission_mode" | "prompt" | "project_id" | "memory_enabled" | "lead_project_ids">;
+
+export interface AgentMemory {
+  enabled: boolean;
+  path: string;
+  files: { name: string; size: number; content: string; truncated: boolean }[];
+}
+
+/** A direct conversation with an agent (orc/chats.py). */
+export interface Chat {
+  id: number;
+  agent_id: number;
+  /** null — a chat outside any repository. */
+  project_id: number | null;
+  title: string;
+  status: "idle" | "queued" | "running" | "waiting";
+  cwd: string | null;
+  branch: string | null;
+  job_id: string | null;
+  session_id: string | null;
+  turn_started_at: string | null;
+  waiting_detail: string | null;
+  last_read_message_id: number;
+  created_at: string;
+  updated_at: string;
+  last_message: string | null;
+  unread: number;
+  /** 1 keeps the chat on top of the list. */
+  pinned: number;
+  /** When the owner archived it; null — it is in the main list. */
+  archived_at: string | null;
+}
+
+export interface ChatProposal {
+  title: string;
+  description: string;
+  agent: string | null;
+  /** The card made from the proposal, once the owner accepted it. */
+  task_id?: number;
+  /** What this step waits for, as the lead linked it: titles of proposals and numbers of cards. */
+  waits_for?: string[];
+  /** The proposals among those: accepting this one accepts them too, if they are still open. */
+  depends_on_messages?: number[];
+}
+
+/** A request from a chat session's hook, the counterpart of InputRequest for a card. */
+export type ChatInputRequest = Omit<InputRequest, "task_id"> & { chat_id: number; decision: InputDecision | null };
+
+export interface ChatMessage {
+  id: number;
+  chat_id: number;
+  role: "user" | "assistant" | "activity" | "system" | "proposal" | "input_request";
+  body: string;
+  /** user: queued | sent | failed | cancelled; proposal: open | accepted | dismissed. */
+  state: string | null;
+  created_at: string;
+  proposal?: ChatProposal;
+  /** input_request: what the session waits on (permission, question, plan); state open | answered | cancelled. */
+  request?: ChatInputRequest;
+}
+
+export interface ChatDetail extends Chat {
+  messages: ChatMessage[];
+}
+
+/** One step of a session as the transcript has it (orc/activity.py). An event never changes once sent. */
+interface ActivityEventBase {
+  id: string;
+  /** Which transcript of the feed it came from: a change between neighbours is a new session. */
+  session: number;
+  offset: number;
+  at: string | null;
+}
+
+export type ActivityEvent = ActivityEventBase &
+  (
+    | { kind: "prompt"; text: string; truncated: boolean; origin: string }
+    | { kind: "text"; text: string; truncated: boolean }
+    /** text is empty when Claude Code did not write the thinking down: only the duration is known. */
+    | { kind: "thinking"; text: string; duration_ms: number | null; truncated: boolean }
+    | {
+        kind: "tool_use";
+        tool_use_id: string;
+        name: string;
+        summary: string;
+        description: string | null;
+        input: string;
+        truncated: boolean;
+        /** Present when the call hands work over to a subagent. */
+        delegate?: { agent_type: string | null; description: string } | null;
+      }
+    | { kind: "tool_result"; tool_use_id: string; text: string; is_error: boolean; truncated: boolean }
+    | { kind: "notice"; notice: "turn_end" | "compacted" | "error"; text: string; level: string; duration_ms?: number }
+  );
+
+/** Background work of a session according to the daemon: a subagent or a background command. */
+export interface ActivityProcess {
+  id: string;
+  kind: string;
+  label: string;
+  status: "running" | "done" | "failed";
+  started_at_ms: number | null;
+  done_at_ms: number | null;
+}
+
+export interface ActivityTodo {
+  label: string;
+  status: "pending" | "in_progress" | "done";
+}
+
+export type ActivityPhase =
+  | "starting" | "working" | "background" | "idle" | "stopped"
+  | "waiting_input" | "waiting_reply" | "quota" | "sleeping" | "delivering"
+  | TaskStatus;
+
+/** What the agent is doing now and what it is stuck on. */
+export interface ActivityNow {
+  phase: ActivityPhase;
+  /** A session is behind it right now, so there is something to watch and to stop. */
+  live: boolean;
+  status: string;
+  has_session: boolean;
+  agent_id?: number | null;
+  waiting_detail: string | null;
+  /** Why a failed task stopped: a crash or the owner's Stop button. */
+  failed_detail: string | null;
+  /** The code of the reason in `failed_detail` and in `blocker_detail` (failures.ts); absent on an older server. */
+  detail_code?: string | null;
+  detail: string;
+  /** The last call that has no result yet: the fallback when the daemon's detail is empty. */
+  current_tool: { name: string; summary: string; at: string | null } | null;
+  tempo: string | null;
+  /** How long the transcript has been silent. */
+  silent_sec: number | null;
+  in_flight: number;
+  processes: ActivityProcess[];
+  todos: ActivityTodo[];
+  input_request?: InputRequest | null;
+  /** What else holds the card: shown as a notice above the composer. Absent from a chat. */
+  blocker?: Blocker | null;
+  blocker_detail?: string | null;
+  /** A message on its way: the work cannot be accepted until it is delivered. */
+  outbox_state?: string | null;
+}
+
+/** Who a delegating call handed its work to (the subagent's meta file). */
+export interface ActivityDelegation {
+  tool_use_id: string;
+  agent_id: string;
+  agent_type: string | null;
+  finished: boolean;
+}
+
+/** A comment of a card, with what became of it on its way to the session. */
+export interface ActivityComment extends Comment {
+  /** What the session receives for this message: images are expanded to paths. null: not a message. */
+  sent_text?: string | null;
+  /** State in the delivery queue. null: it did not go through the queue. */
+  delivery?: string | null;
+}
+
+/** A moment in the task's life from its event log: started, verified, merged. */
+export interface ActivityStage {
+  id: number;
+  at: string;
+  level: string;
+  text: string;
+}
+
+export interface ActivityPage {
+  events: ActivityEvent[];
+  /** Pass on the next poll. null: there is no transcript yet. */
+  cursor: string | null;
+  /** Pass as `before` to read further back. null: the beginning has been reached. */
+  earlier: string | null;
+  now: ActivityNow;
+  delegations?: ActivityDelegation[];
+  /** null: a chat, which has no comments of its own. */
+  comments?: ActivityComment[] | null;
+  stages?: ActivityStage[];
+}
+
+/** A real OS process of a session: the session itself and its descendants. */
+export interface OsProcess {
+  pid: number;
+  ppid: number;
+  elapsed_sec: number | null;
+  cpu_pct: number;
+  rss_kb: number;
+  command: string;
+  depth: number;
+}
+
+export interface OsProcesses {
+  pid: number | null;
+  processes: OsProcess[];
+}
+
+/** A task or a chat turn, as the agents page lists them. */
+export interface AgentRun {
+  kind: "task" | "chat";
+  id: number;
+  title: string;
+  /** null: a task without an agent, run by the project's defaults. */
+  agent_id: number | null;
+  project_id: number | null;
+  status: string;
+  started_at: string | null;
+  updated_at: string;
+  /** Only for a run in work. */
+  now: ActivityNow | null;
+}
+
+export interface AgentsActivity {
+  runs: AgentRun[];
+  recent: AgentRun[];
+}
+
+/** A task or a chat of one agent in its history (orc/agent_work.py). */
+export interface AgentWorkRun {
+  kind: "task" | "chat";
+  id: number;
+  title: string;
+  project_id: number | null;
+  status: string;
+  live: boolean;
+  started_at: string | null;
+  finished_at: string | null;
+  updated_at: string;
+  tokens: number;
+  /** null: no estimate for this run. */
+  cost_usd: number | null;
+  archived: boolean;
+  routine_id: number | null;
+}
+
+/** Everything one agent has done so far: the totals, spending by day and the history of its runs. */
+export interface AgentWork {
+  summary: {
+    tasks_total: number;
+    tasks_by_status: Record<string, number>;
+    tasks_done: number;
+    tasks_failed: number;
+    chats_total: number;
+    tokens: number;
+    cost_usd: number | null;
+    /** Tokens per model, the largest first. */
+    models: Record<string, number>;
+    /** Time spent in finished tasks, from the first session to the end. */
+    busy_ms: number;
+    avg_run_ms: number | null;
+    first_run_at: string | null;
+  };
+  /** The last two weeks, from the spending log; chats are not in it. */
+  daily: { day: string; tokens: number; cost_usd: number }[];
+  runs: AgentWorkRun[];
+  total_runs: number;
 }

@@ -1,12 +1,12 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { it, expect, vi, describe } from "vitest";
-import { Board, DONE_PAGE_SIZE, byPosition, canMove, isForceMove, isMissingDescription, withWaitingFirst } from "./Board";
+import { Board, DONE_PAGE_SIZE, byPosition, canMove, isForceMove, moveIssues, withWaitingFirst } from "./Board";
 import type { Task } from "../types";
 
 const base: Task = {
   id: 1, project_id: 1, title: "Do X", description: "", status: "todo", priority: "high", blocker: null,
-  blocker_detail: null, target_branch: "dev", model: null, effort: null, permission_mode: null, verify_cmd: null,
+  blocker_detail: null, target_branch: "dev", verify_cmd: null,
   requires_review: 0, worktree_path: null, branch: null, job_id: null, session_id: null, auto_resume_count: 0,
   state_miss_count: 0, quota_retry_count: 0, conflict_retry_count: 0, resume_with: null, outbox_state: null,
   merge_queued_at: null, retry_after: null,
@@ -19,7 +19,7 @@ const columnOf = (title: string): HTMLElement => screen.getByRole("region", { na
 
 it("renders four columns and a card with badges", () => {
   const tasks = [base, { ...base, id: 2, title: "Needs answer", status: "in_progress" as const, priority: "normal" as const, blocker: "needs_input" as const, depends_on: [] }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   for (const title of ["Backlog", "To do", "In progress", "Done"]) {
     expect(screen.getByRole("region", { name: title })).toBeInTheDocument();
   }
@@ -36,7 +36,7 @@ it("renders four columns and a card with badges", () => {
 it("the \"after #N\" badge opens the blocking task, not its own card", async () => {
   const onOpen = vi.fn();
   const tasks = [base, { ...base, id: 2, title: "Waiting on this", depends_on: [] }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={onOpen} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={onOpen} onCreate={vi.fn()} />);
   await userEvent.click(screen.getByRole("button", { name: "after #2" }));
   expect(onOpen).toHaveBeenCalledTimes(1);
   expect(onOpen).toHaveBeenCalledWith(2);
@@ -50,7 +50,7 @@ it("tasks waiting for input are put on a shelf in \"In progress\", the badge nam
     { ...base, id: 3, title: "Just working", status: "in_progress" as const, depends_on: [] },
     { ...base, id: 2, title: "Needs answer", status: "in_progress" as const, blocker: "needs_input" as const, input_request: request, depends_on: [] },
   ];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   const inProgress = columnOf("In progress");
   expect(within(inProgress).getByText("Waiting for input")).toBeInTheDocument();
   expect(within(inProgress).getByText("Working")).toBeInTheDocument();
@@ -60,13 +60,13 @@ it("tasks waiting for input are put on a shelf in \"In progress\", the badge nam
 });
 
 it("without waiting tasks there is no shelf in \"In progress\"", () => {
-  render(<Board projectId={1} tasks={[{ ...base, status: "in_progress", depends_on: [] }]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={[{ ...base, status: "in_progress", depends_on: [] }]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.queryByText("Waiting for input")).not.toBeInTheDocument();
   expect(screen.queryByText("Working")).not.toBeInTheDocument();
 });
 
 it("failed is shown in the Done column with a badge", () => {
-  render(<Board projectId={1} tasks={[{ ...base, status: "failed" }]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={[{ ...base, status: "failed" }]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.getByText("Failed")).toBeInTheDocument();
   expect(columnOf("Done")).toContainElement(screen.getByText("Do X"));
 });
@@ -78,7 +78,7 @@ it("verifying and merging are shown in the \"In progress\" column with a stage b
     { ...base, id: 3, title: "Being verified", status: "verifying" as const, depends_on: [] },
     { ...base, id: 4, title: "Queued for merge", status: "merging" as const, depends_on: [] },
   ];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   const inProgress = columnOf("In progress");
   expect(inProgress).toContainElement(screen.getByText("Being verified"));
   expect(inProgress).toContainElement(screen.getByText("Queued for merge"));
@@ -90,24 +90,24 @@ it("verifying and merging are shown in the \"In progress\" column with a stage b
 // in "In progress" again, and the badge should show that branches are being reconciled there, not code written.
 it("a task resolving a conflict sits in \"In progress\" with a badge", () => {
   const tasks = [{ ...base, id: 5, title: "Resolving", status: "in_progress" as const, conflict_retry_count: 1, depends_on: [] }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(columnOf("In progress")).toContainElement(screen.getByText("Resolving"));
   expect(screen.getByText("resolving conflict")).toBeInTheDocument();
 });
 
 it("there is no \"resolving conflict\" badge once the task has left In progress", () => {
   const tasks = [{ ...base, id: 6, title: "Finished", status: "done" as const, conflict_retry_count: 2, depends_on: [] }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.queryByText("resolving conflict")).not.toBeInTheDocument();
 });
 
 it("the card shows the message delivery state", () => {
-  render(<Board projectId={1} tasks={[{ ...base, outbox_state: "sent" }]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={[{ ...base, outbox_state: "sent" }]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.getByText("message sent to session")).toBeInTheDocument();
 });
 
 it("the card names a stalled delivery as such", () => {
-  render(<Board projectId={1} tasks={[{ ...base, outbox_state: "stalled" }]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={[{ ...base, outbox_state: "stalled" }]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.getByText("message not picked up")).toBeInTheDocument();
 });
 
@@ -172,23 +172,23 @@ describe("isForceMove: which move requires confirmation", () => {
 // The agent session gets the task's description, not its title (orc/prompt.py), so a card
 // with an empty description must not be allowed to go to "To work": the session would burn limits inventing
 // work itself. The server rejects it the same way (orc/api.py, _check_description_for_work).
-describe("isMissingDescription: an empty description is not let into work", () => {
+describe("moveIssues: an empty description is not let into work", () => {
   const empty = { ...base, description: "" };
   const spaces = { ...base, description: "   \n  " };
   const filled = { ...base, description: "fix login" };
 
   it("catches an empty and a whitespace-only description on a move to \"To work\"", () => {
-    expect(isMissingDescription(empty, "todo")).toBe(true);
-    expect(isMissingDescription(spaces, "todo")).toBe(true);
+    expect(moveIssues(empty, "todo")).toContain("description");
+    expect(moveIssues(spaces, "todo")).toContain("description");
   });
 
   it("lets a task with a description through", () => {
-    expect(isMissingDescription(filled, "todo")).toBe(false);
+    expect(moveIssues(filled, "todo")).not.toContain("description");
   });
 
   it("does not interfere with other moves: the rule is about work, not about an empty field in general", () => {
-    expect(isMissingDescription(empty, "backlog")).toBe(false);
-    expect(isMissingDescription(empty, "done")).toBe(false);
+    expect(moveIssues(empty, "backlog")).not.toContain("description");
+    expect(moveIssues(empty, "done")).not.toContain("description");
   });
 });
 
@@ -249,7 +249,7 @@ describe("board filters", () => {
     { ...base, id: 3, title: "Ship release", status: "done", blocker: null, depends_on: [] },
   ];
   const render3 = (props: Partial<React.ComponentProps<typeof Board>> = {}) =>
-    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} {...props} />);
+    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} {...props} />);
 
   it("search narrows the board by title and by number", () => {
     const { unmount } = render3({ search: "login" });
@@ -281,13 +281,13 @@ describe("archive", () => {
   const archived: Task = { ...base, id: 9, title: "Archived one", status: "done", archived_at: "2026-09-21T10:00:00+00:00", depends_on: [] };
 
   it("archived cards are not shown on the board by default", () => {
-    render(<Board projectId={1} tasks={[base, archived]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={[base, archived]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(screen.getByText("Do X")).toBeInTheDocument();
     expect(screen.queryByText("Archived one")).not.toBeInTheDocument();
   });
 
   it("the archive view shows only removed tasks and marks them with a badge", () => {
-    render(<Board projectId={1} tasks={[base, archived]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} showArchived />);
+    render(<Board projectId={1} tasks={[base, archived]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} showArchived />);
     expect(screen.getByText("Archived one")).toBeInTheDocument();
     expect(screen.queryByText("Do X")).not.toBeInTheDocument();
     expect(screen.getByText("archived")).toBeInTheDocument();
@@ -297,7 +297,7 @@ describe("archive", () => {
 
   it("in the archive view the \"Done\" filter does not hide the column", () => {
     render(
-      <Board projectId={1} tasks={[archived]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} showArchived showDone={false} />,
+      <Board projectId={1} tasks={[archived]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} showArchived showDone={false} />,
     );
     expect(screen.getByRole("region", { name: "Done" })).toBeInTheDocument();
   });
@@ -320,13 +320,13 @@ describe("a long list in a column", () => {
     const done = Array.from({ length: DONE_PAGE_SIZE + 5 }, (_, i) => ({
       ...base, id: 100 + i, title: `Finished ${i}`, status: "done" as const, depends_on: [],
     }));
-    render(<Board projectId={1} tasks={done} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={done} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(cardOf(`Finished ${done.length - 1}`).className).toContain("shrink-0");
     expect(cardOf(`Finished ${done.length - DONE_PAGE_SIZE}`).className).toContain("shrink-0");
   });
 
   it("the column's list scrolls inside itself and does not drag its neighbours along", () => {
-    render(<Board projectId={1} tasks={[base]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={[base]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     for (const title of ["Backlog", "To do", "In progress", "Done"]) {
       const list = listOf(title);
       expect(list.className).toContain("overflow-y-auto");
@@ -359,7 +359,7 @@ describe("order in the \"Done\" column", () => {
   const board = (props: Partial<React.ComponentProps<typeof Board>> = {}) =>
     render(
       <Board
-        projectId={1} tasks={three} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()}
+        projectId={1} tasks={three} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()}
         onOpen={vi.fn()} onCreate={vi.fn()} {...props}
       />,
     );
@@ -425,7 +425,7 @@ describe("chunks in the \"Done\" column", () => {
   const cardsIn = (column: string) => columnOf(column).querySelectorAll('[role="button"]');
 
   const renderMany = () =>
-    render(<Board projectId={1} tasks={many} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={many} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
 
   it("only the first chunk is drawn right away, and the column counter tells the truth", () => {
     renderMany();
@@ -441,7 +441,7 @@ describe("chunks in the \"Done\" column", () => {
   });
 
   it("a short list does not grow a button", () => {
-    render(<Board projectId={1} tasks={[{ ...base, status: "done" }]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={[{ ...base, status: "done" }]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(screen.queryByRole("button", { name: /Show \d+ more/ })).not.toBeInTheDocument();
   });
 });
@@ -456,7 +456,7 @@ describe("tokens", () => {
       { ...base, id: 2, status: "failed" as const, depends_on: [], usage_json: usage(750_000) },
       { ...base, id: 3, status: "done" as const, depends_on: [], usage_json: null },
     ];
-    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(screen.getByText("4,3M")).toBeInTheDocument();
     expect(screen.getByText("750k")).toBeInTheDocument();
     expect(within(columnOf("Done")).getByText("5M")).toBeInTheDocument();
@@ -469,7 +469,7 @@ describe("tokens", () => {
       { ...base, id: 1, status: "done" as const, depends_on: [], usage_json: null },
       { ...base, id: 2, status: "done" as const, depends_on: [], usage_json: usage(0) },
     ];
-    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
     expect(document.querySelector("[title^='total tokens']")).toBeNull();
   });
 });
@@ -477,14 +477,14 @@ describe("tokens", () => {
 it("a scheduled task shows a countdown to its start", () => {
   const at = new Date(Date.now() + (2 * 60 + 15) * 60_000 + 30_000).toISOString();
   const tasks = [{ ...base, depends_on: [], start_after: at }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.getByText("starts in 2 h 15 min")).toBeInTheDocument();
 });
 
 it("a missed window is visible on the card in the backlog", () => {
   const tasks = [{ ...base, status: "backlog" as const, depends_on: [],
     start_after: new Date(Date.now() - 3 * 3_600_000).toISOString(), start_before: new Date(Date.now() - 3_600_000).toISOString() }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.getByText("start window missed")).toBeInTheDocument();
 });
 
@@ -492,7 +492,7 @@ it("a missed window is visible on the card in the backlog", () => {
 it("a backlog task with a future start shows \"not before\", not a countdown", () => {
   const at = new Date(Date.now() + 2 * 3_600_000 + 30_000).toISOString();
   const tasks = [{ ...base, status: "backlog" as const, depends_on: [], start_after: at }];
-  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+  render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
   expect(screen.getByText(/^not before /)).toBeInTheDocument();
   expect(screen.queryByText(/starts in/)).not.toBeInTheDocument();
 });
@@ -511,7 +511,7 @@ describe("viewing results", () => {
     done(5, "Crashed", { status: "failed", done_at: null, updated_at: "2026-03-27T10:00:00+00:00" }),
   ];
   const renderDone = (props: Partial<React.ComponentProps<typeof Board>> = {}) =>
-    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} {...props} />);
+    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} {...props} />);
   const viewing = () => ({ onToggle: vi.fn(), onMarkAll: vi.fn() });
   const titlesIn = (column: HTMLElement) =>
     within(column).getAllByText(/seen|Crashed/i).map((el) => el.textContent);
@@ -569,16 +569,60 @@ describe("viewing results", () => {
     expect(control.onMarkAll).toHaveBeenCalledOnce();
     unmount();
 
-    render(<Board projectId={1} tasks={[tasks[0], tasks[2]]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} viewing={viewing()} />);
+    render(<Board projectId={1} tasks={[tasks[0], tasks[2]]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} viewing={viewing()} />);
     expect(screen.queryByText("Not viewed")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Mark all" })).not.toBeInTheDocument();
   });
 
   it("in the archive view viewing is not marked", () => {
     const archived = done(9, "Removed unseen", { archived_at: "2026-09-21T10:00:00+00:00" });
-    render(<Board projectId={1} tasks={[archived]} onMove={vi.fn()} onReorder={vi.fn()} onEmptyDescription={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} showArchived viewing={viewing()} />);
+    render(<Board projectId={1} tasks={[archived]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} showArchived viewing={viewing()} />);
     expect(screen.getByText("Removed unseen")).toBeInTheDocument();
     expect(screen.queryByText("Not viewed")).not.toBeInTheDocument();
     expect(screen.queryByRole("checkbox")).not.toBeInTheDocument();
   });
+});
+
+describe("labels and the due date on a card", () => {
+  const labels = [{ id: 1, name: "bug", color: "#ff0000" }, { id: 2, name: "ui", color: "#00ff00" }];
+
+  it("shows the labels and a due date on the card", () => {
+    const tasks = [{ ...base, depends_on: [], labels, due_date: "2099-01-05" }];
+    render(<Board projectId={1} tasks={tasks} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    expect(screen.getByText("bug")).toBeInTheDocument();
+    expect(screen.getByText("ui")).toBeInTheDocument();
+    expect(screen.getByTitle("Due date")).toBeInTheDocument();
+  });
+
+  it("marks an overdue date on an open card, and not on a finished one", () => {
+    const open = { ...base, id: 1, depends_on: [], due_date: "2000-01-05" };
+    const done = { ...base, id: 2, title: "Closed", status: "done" as const, depends_on: [], due_date: "2000-01-05", done_at: "2000-01-04T00:00:00Z" };
+    render(<Board projectId={1} tasks={[open, done]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    expect(screen.getAllByTitle("Overdue")).toHaveLength(1);
+  });
+
+  it("narrows the board to one label", () => {
+    const tasks = [
+      { ...base, id: 1, title: "Has bug", depends_on: [], labels: [labels[0]] },
+      { ...base, id: 2, title: "Has ui", depends_on: [], labels: [labels[1]] },
+      { ...base, id: 3, title: "No labels", depends_on: [] },
+    ];
+    const { rerender } = render(<Board projectId={1} tasks={tasks} labelId={1} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    expect(screen.getByText("Has bug")).toBeInTheDocument();
+    expect(screen.queryByText("Has ui")).not.toBeInTheDocument();
+    expect(screen.queryByText("No labels")).not.toBeInTheDocument();
+    rerender(<Board projectId={1} tasks={tasks} labelId={null} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />);
+    expect(screen.getByText("No labels")).toBeInTheDocument();
+  });
+});
+
+it("a parent card shows done/total of its subtasks, counted from all cards rather than the board's list", async () => {
+  const { SubtaskProgressContext } = await import("../subtaskProgress");
+  const parent = { ...base, id: 5, title: "Epic", depends_on: [] };
+  render(
+    <SubtaskProgressContext.Provider value={new Map([[5, { done: 1, total: 3 }]])}>
+      <Board projectId={1} tasks={[parent]} onMove={vi.fn()} onReorder={vi.fn()} onNotReady={vi.fn()} onOpen={vi.fn()} onCreate={vi.fn()} />
+    </SubtaskProgressContext.Provider>,
+  );
+  expect(screen.getByTitle("1 of 3 subtasks done")).toHaveTextContent("1/3");
 });

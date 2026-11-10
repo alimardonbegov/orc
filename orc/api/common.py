@@ -6,14 +6,14 @@ import re
 import secrets
 from dataclasses import asdict
 from pathlib import Path
+from typing import Any
 
 from fastapi import HTTPException, Request
 
-from orc import branches, git_ops, projects, schedule
+from orc import branches, card_settings, git_ops, projects, quick_create, schedule, stages
 from orc.attachments import AttachmentStore
 from orc.models import TaskStatus
 from orc.prompt import build_conflict_prompt, build_prompt
-from orc.report import REPORT_REL_PATH
 from orc.util import utc_now
 
 # Transitions that may be made by hand (drag on the board). Everything else is moved by the dispatcher.
@@ -36,8 +36,8 @@ PERMISSION_MODES = {"auto", "acceptEdits", "dontAsk", "bypassPermissions"}
 SETTING_KEYS = {"global_max_workers", "prompt_template", "quota_patterns", "poll_interval_sec",
                 "conflict_autoresolve", "conflict_prompt_template", "verify_workers",
                 "events_retention_days", "attachments_max_total_mb",
-                "worktree_autoclean", "worktree_retention_days", "hidden_models", "session_reaper",
-                "start_max_load_pct", "start_min_free_mem_pct"}
+                "worktree_autoclean", "worktree_retention_days", "hidden_models", "card_settings", "session_reaper",
+                "start_max_load_pct", "start_min_free_mem_pct", "quick_create_model"}
 # The target branch can be changed only while the task is not running: the worktree is created from one base,
 # and swapping the branch on in_progress/verifying/merging sends the merge to the wrong place.
 TARGET_BRANCH_EDITABLE = {TaskStatus.BACKLOG, TaskStatus.TODO, TaskStatus.FAILED}
@@ -65,6 +65,18 @@ def _attachments(request: Request) -> AttachmentStore:
 def _check_mode(mode: str | None) -> None:
     if mode is not None and mode not in PERMISSION_MODES:
         raise HTTPException(400, f"permission mode must be one of {sorted(PERMISSION_MODES)}")
+
+
+def _check_agent(repo, agent_id: int | None, project_id: int | None) -> None:
+    """A task or routine may use a shared agent or one internal to its own project. Without a project
+    (project_id None) only a shared agent fits."""
+    if agent_id is None:
+        return
+    agent = repo.get_agent(agent_id)
+    if agent is None:
+        raise HTTPException(400, "agent not found")
+    if agent.project_id is not None and agent.project_id != project_id:
+        raise HTTPException(400, f"agent '{agent.name}' is internal to another project")
 
 
 def _check_int_setting(key: str, raw: str, minimum: int, maximum: int | None = None) -> None:
@@ -106,12 +118,11 @@ def _check_placeholders(key: str, raw: str, allowed: str) -> None:
 
 def _check_prompt_template(raw: str) -> None:
     _check_placeholders("prompt_template", raw,
-                        "{title}, {description}, {branch}, {target_branch}, {verify_cmd}, {report_path}")
+                        "{title}, {description}, {branch}, {target_branch}, {verify_cmd}")
     # A broken curly brace in the template breaks _start of every task: run it through the same
     # build_prompt with dummy values as the dispatcher
     try:
-        build_prompt(raw, title="t", description="d", branch="b", target_branch="tb",
-                     verify_cmd="c", report_path=REPORT_REL_PATH)
+        build_prompt(raw, title="t", description="d", branch="b", target_branch="tb", verify_cmd="c")
     except Exception as e:
         raise HTTPException(400, f"setting prompt_template: the template does not expand ({e})")
 
@@ -119,10 +130,10 @@ def _check_prompt_template(raw: str) -> None:
 def _check_conflict_prompt_template(raw: str) -> None:
     _check_placeholders("conflict_prompt_template", raw,
                         "{title}, {description}, {branch}, {target_branch}, {verify_cmd}, "
-                        "{report_path}, {files}, {incoming}, {untrusted_note}")
+                        "{orc}, {files}, {incoming}, {untrusted_note}")
     try:
         build_conflict_prompt(raw, title="t", description="d", branch="b", target_branch="tb",
-                              verify_cmd="c", report_path=REPORT_REL_PATH, files=["f"], incoming=["c"])
+                              verify_cmd="c", orc_command="o", files=["f"], incoming=["c"])
     except Exception as e:
         raise HTTPException(400, f"setting conflict_prompt_template: the template does not expand ({e})")
 
@@ -172,6 +183,23 @@ def _hidden_models_out(raw: str | None) -> list[str] | None:
     return normalize_hidden_models([m for m in models if isinstance(m, str)])
 
 
+def _parse_card_settings(key: str, raw: str) -> dict:
+    try:
+        return card_settings.normalize(json.loads(raw))
+    except ValueError as e:  # json.JSONDecodeError is a ValueError too
+        raise HTTPException(400, f"setting {key}: {e}")
+
+
+def check_card_settings(repo, raw: Any, project_id: int | None) -> dict:
+    """A settings object from a request, checked, with its default agent usable at that level."""
+    try:
+        settings = card_settings.normalize(raw)
+    except ValueError as e:
+        raise HTTPException(400, f"card_settings: {e}")
+    _check_agent(repo, settings.get(card_settings.DEFAULT_AGENT), project_id)
+    return settings
+
+
 def _check_flag(key: str, raw: str) -> None:
     if raw not in ("0", "1"):
         raise HTTPException(400, f"setting {key}: expected \"0\" or \"1\", got {raw!r}")
@@ -200,8 +228,13 @@ def _check_settings(body: dict[str, str]) -> None:
             _check_int_setting(key, value, minimum=0)
         elif key == "attachments_max_total_mb":
             _check_int_setting(key, value, minimum=1)
+        elif key == "quick_create_model":
+            if value.strip() and not quick_create.MODEL_RE.match(value.strip()):
+                raise HTTPException(400, f"{key}: {value!r} is not a model id")
         elif key == "hidden_models":
             _parse_hidden_models(key, value)
+        elif key == "card_settings":
+            _parse_card_settings(key, value)
 
 
 def _check_branch_exists(repo_path: Path | str, branch: str | None) -> None:
@@ -224,6 +257,20 @@ EMPTY_DESCRIPTION_ERROR = (
     "the task description is empty, and the description is exactly what the agent receives: the title "
     "alone is not a task. Write the description and send the card again"
 )
+
+
+UNASSIGNED_ERROR = (
+    "the task has no assignee, which means a person works on it and the dispatcher has nothing to start. "
+    "Assign an agent and send the card again"
+)
+
+
+def _check_assignee_for_work(agent_id: int | None, routine_id: int | None = None) -> None:
+    """A card nobody is assigned to belongs to a person. So it is not let into work, neither by hand nor
+    by retry. A routine's run is the exception: it carries the routine's own parameters (orc/routines.py)
+    and already went to work without an agent, so it can be sent again."""
+    if agent_id is None and routine_id is None:
+        raise HTTPException(400, UNASSIGNED_ERROR)
 
 
 def _check_description_for_work(description: str | None) -> None:
@@ -252,6 +299,26 @@ def _branch_op(action) -> dict:
     except git_ops.GitError as e:
         raise HTTPException(400, str(e))
     return {**view, "note": note}
+
+
+def _check_parent(repo, parent_id: int | None, task_id: int | None = None) -> None:
+    """The parent exists and is not the card itself or one of its own subtasks. task_id=None means a new card,
+    which nothing can be a subtask of yet. The walk keeps a seen set: a ring already in the data must not hang it."""
+    if parent_id is None:
+        return
+    if repo.get_task(parent_id) is None:
+        raise HTTPException(400, f"parent: task #{parent_id} does not exist")
+    if task_id is None:
+        return
+    if parent_id == task_id:
+        raise HTTPException(400, "parent: a card cannot be a subtask of itself")
+    seen: set[int] = set()
+    current = repo.get_task(parent_id)
+    while current is not None and current.parent_task_id is not None and current.id not in seen:
+        seen.add(current.id)
+        if current.parent_task_id == task_id:
+            raise HTTPException(400, f"parent: #{parent_id} is already a subtask of #{task_id}, the two would close into a ring")
+        current = repo.get_task(current.parent_task_id)
 
 
 def _check_deps(repo, depends_on: list[int], task_id: int | None = None) -> None:
@@ -283,6 +350,10 @@ def _check_deps(repo, depends_on: list[int], task_id: int | None = None) -> None
             continue
         seen.add(current)
         stack.extend(deps.get(current, []))
+    # The same ring through the stages of the siblings: a link to a card of a later stage of the same parent
+    stage_nodes = [(t.id, t.parent_task_id, t.stage) for t in repo.list_tasks()]
+    if stages.closes_ring(task_id, stage_nodes, {**repo.all_deps(), task_id: depends_on}):
+        raise HTTPException(400, "dependency: this would make the card wait for itself through the stages of its siblings")
 
 
 # How to return the archive in the project list. The default is hide, as with tasks: a client that knows
@@ -299,6 +370,7 @@ def _project_out(project) -> dict:
     The check is file-based (see orc/projects.py), so there is no extra git process here.
     """
     return {**asdict(project), "hidden_models": _hidden_models_out(project.hidden_models),
+            "card_settings": card_settings.parse(project.card_settings),
             **projects.path_status(project.path)}
 
 
@@ -342,9 +414,29 @@ def _check_hook_secret(request: Request, task_id: int) -> None:
         raise HTTPException(403, "wrong hook secret: the request did not come from this task's session")
 
 
+def _check_chat_hook_secret(request: Request, chat_id: int) -> None:
+    """The chat counterpart of _check_hook_secret: a hook presents the secret issued with its session."""
+    chat = _repo(request).get_chat(chat_id)
+    if chat is None:
+        return  # the endpoint answers 404/409 itself
+    if not chat.hook_secret:
+        raise HTTPException(403, "the chat has no hook secret: it is issued together with the session")
+    got = request.headers.get("x-orc-hook") or ""
+    if not secrets.compare_digest(got.encode("utf-8"), chat.hook_secret.encode("utf-8")):
+        raise HTTPException(403, "wrong hook secret: the request did not come from this chat's session")
+
+
+def _chat_request_view(message: dict) -> dict:
+    """An input request stored as a chat message, in the shape of an input_requests row without the JSON strings."""
+    data = json.loads(message["body"])
+    return {"id": message["id"], "chat_id": message["chat_id"], "kind": data["kind"], "tool_name": data["tool_name"],
+            "tool_input": data["tool_input"], "summary": data["summary"], "decision": data["decision"],
+            "state": message["state"], "created_at": message["created_at"]}
+
+
 # Task fields that must not go outwards. A list, not "delete hook_secret":
 # the next such field must land here too, rather than slip in around it.
-PRIVATE_TASK_FIELDS = {"hook_secret"}
+PRIVATE_TASK_FIELDS = {"hook_secret", "batch_key"}
 
 
 def _task_out(task) -> dict:
@@ -365,7 +457,9 @@ def _input_request_view(row: dict | None) -> dict | None:
 
 
 def _task_detail(repo, task) -> dict:
-    return {**_task_out(task), "depends_on": repo.deps_of(task.id), "started_at": repo.first_session_time(task.id),
+    return {**_task_out(task), "depends_on": repo.deps_of(task.id), "stage_blocked_by": _stage_blocked_by(repo).get(task.id, []),
+            "started_at": repo.first_session_time(task.id),
+            "labels": repo.labels_of(task.id),
             "comments": repo.list_comments(task.id),
             "outbox": repo.pending_messages(task.id),
             "input_request": _input_request_view(repo.open_input_request(task.id))}
@@ -375,3 +469,43 @@ def _task_detail(repo, task) -> dict:
 # about the archive keeps getting exactly the board. The dashboard requests all and sorts it out itself,
 # otherwise the "Archive" toggle would cost a second server poll.
 ARCHIVED_FILTERS = {"hide": False, "only": True, "all": None}
+
+
+def _plan_or_400(labels_in: list[str] | None, start_date: str | None, due_date: str | None) -> tuple[list[str] | None, str | None, str | None]:
+    """The planning part of a request (orc/labels.py): normalized label names and dates, or a 400 with text."""
+    from orc import labels
+
+    try:
+        names = labels.normalize_names(labels_in) if labels_in is not None else None
+        start, due = labels.normalize_date(start_date), labels.normalize_date(due_date)
+        labels.check_date_order(start, due)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return names, start, due
+
+
+MAX_STAGE = 999
+
+
+def _stage_blocked_by(repo) -> dict[int, list[int]]:
+    """The stage blockers of every live card (orc/stages.py), which the board shows beside depends_on.
+    Computed over all live cards, never over a filtered list: a filter must not change what a card waits for."""
+    return stages.stage_blockers((t.id, t.parent_task_id, t.stage) for t in repo.list_tasks())
+
+
+def _check_stage(repo, stage: int | None, parent_id: int | None, task_id: int | None, depends_on: list[int]) -> None:
+    """A stage is a positive number, belongs to a card with a parent, and must not close a ring with the card's links.
+
+    task_id=None means a card being created: it is checked as a virtual card, so a ring through it is caught before
+    it is written. `depends_on` is the card's blockers as they will be after the request."""
+    if stage is None:
+        return
+    if not 1 <= stage <= MAX_STAGE:
+        raise HTTPException(400, f"stage: expected a number from 1 to {MAX_STAGE}")
+    if parent_id is None:
+        raise HTTPException(400, "stage: only a subtask has a stage, and this card has no parent")
+    me = task_id if task_id is not None else -1
+    nodes = [(t.id, t.parent_task_id, t.stage) for t in repo.list_tasks() if t.id != task_id]
+    nodes.append((me, parent_id, stage))
+    if stages.closes_ring(me, nodes, {**repo.all_deps(), me: depends_on}):
+        raise HTTPException(400, "stage: this would make the card wait for itself, through its links and the stages of its siblings")

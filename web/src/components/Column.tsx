@@ -47,13 +47,15 @@ interface Props {
    * (withUnviewedFirst): the column only labels the shelf.
    */
   viewing?: { onToggle: (taskId: number, viewed: boolean) => void; onMarkAll: () => void };
+  /** Selection for bulk actions (see BatchToolbar). */
+  selection?: { ids: ReadonlySet<number>; onToggle: (taskId: number) => void };
 }
 
 /**
  * One board "compartment". The heading is in normal case with a coloured status dot: all-caps
  * labels in a row of columns read like a fence.
  */
-export function Column({ status, title, tasks, onOpen, action, dragging, accepts, emptyHint, reorderable, pageSize, resetKey, summary, dayOf, viewing }: Props) {
+export function Column({ status, title, tasks, onOpen, action, dragging, accepts, emptyHint, reorderable, pageSize, resetKey, summary, dayOf, viewing, selection }: Props) {
   const { t } = useTranslation();
   const { setNodeRef, isOver } = useDroppable({ id: status, disabled: dragging && !accepts });
   const meta = STATUS_META[status];
@@ -134,6 +136,11 @@ export function Column({ status, title, tasks, onOpen, action, dragging, accepts
         task={task}
         onOpen={onOpen}
         sortable={reorderable}
+        selection={
+          selection
+            ? { selected: selection.ids.has(task.id), any: selection.ids.size > 0, onToggle: () => selection.onToggle(task.id) }
+            : undefined
+        }
         viewing={
           viewing && task.status === "done" && !task.archived_at
             ? { viewed: !isUnviewed(task), onToggle: (viewed) => viewing.onToggle(task.id, viewed) }

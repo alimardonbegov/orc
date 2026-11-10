@@ -1,8 +1,9 @@
 """Working copies in a project's .claude/worktrees: an overview for the UI, deletion and auto-cleanup.
 
-A task worktree is deliberately not deleted after the merge: "Rework" relies on it, resuming
-the same session in the same folder (Dispatcher.rework). The price is a repository copy (often
-with node_modules and builds) for every task ever started, gigabytes per month.
+A task worktree is removed right after its merge (remove_merged); whatever could not be removed then
+(a busy folder, uncommitted files) is taken later by autoclean. "Rework" resumes the session in the same
+folder (Dispatcher.rework), so it is unavailable once the copy is gone. A kept copy costs a repository copy
+(often with node_modules and builds) per task, gigabytes per month.
 Everything is gathered here to see this price and pay it consciously: what the copy is, whose it is,
 how much it weighs, whether its work is merged, whether anything is uncommitted and whether someone is working in it right now.
 
@@ -32,6 +33,7 @@ log = logging.getLogger("orc.worktrees")
 
 WORKTREES_REL = Path(".claude") / "worktrees"
 TASK_DIR_RE = re.compile(r"^orc-task-(\d+)$")
+CHAT_DIR_RE = re.compile(r"^orc-chat-(\d+)$")
 MERGE_DIR_RE = re.compile(r"^orc-merge-(\d+)$")
 
 # du takes seconds to size a gigabyte-scale folder with node_modules; more than a minute is no longer
@@ -183,7 +185,7 @@ class _Entry:
     name: str
     path: Path
     git: dict | None  # entry from `git worktree list`; None means git does not know the folder
-    kind: str  # task | merge | foreign
+    kind: str  # task | merge | chat | foreign
     task_id: int | None
     task: Task | None
 
@@ -202,7 +204,7 @@ def _entries(project: Project, tasks: list[Task]) -> list[_Entry]:
     for name in sorted(names):
         task_match, merge_match = TASK_DIR_RE.match(name), MERGE_DIR_RE.match(name)
         task_id = int((task_match or merge_match).group(1)) if (task_match or merge_match) else None
-        kind = "task" if task_match else "merge" if merge_match else "foreign"
+        kind = "task" if task_match else "merge" if merge_match else "chat" if CHAT_DIR_RE.match(name) else "foreign"
         entries.append(_Entry(name=name, path=base / name, git=registered.get(name), kind=kind,
                               task_id=task_id, task=by_id.get(task_id) if task_id is not None else None))
     return entries
@@ -278,6 +280,8 @@ def _describe(entry: _Entry, probe: dict, procs: list[dict] | None) -> dict:
                             f"only the folder will be deleted)")
         else:
             warnings.append(f"commits without a branch (detached HEAD) are not merged into {probe['target']} and will be lost")
+    if entry.kind == "chat":
+        warnings.append("this is the working copy of an agent chat: the chat gets a fresh copy of its branch on the next message")
     if entry.kind == "foreign":
         warnings.append("this is not an orchestrator task: the copy may have been opened by you or by a Claude Code session")
     if entry.kind == "task" and task is not None and task.session_id:
@@ -440,6 +444,32 @@ def _parse_iso(raw: str | None) -> datetime | None:
     except ValueError:
         return None
     return at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+
+
+def remove_merged(store, project: Project, task: Task, claude_json_path: Path | None = None) -> dict | None:
+    """Remove ONE task's copy right after its merge. Returns the removed item, or None when the copy stayed.
+
+    The merge has put the whole branch into the target, so the copy only takes disk space. It takes the same
+    safe set as autoclean (nothing uncommitted, nobody in the folder, branch merged) and leaves the rest to the
+    periodic cleanup. A card with unfinished subtasks keeps its copy: waking the parent continues its session there.
+    """
+    if not task.worktree_path:
+        return None
+    path = Path(task.worktree_path)
+    if not path.is_dir():
+        return None
+    siblings = store.list_tasks(project.id, archived=None)
+    if any(t.parent_task_id == task.id and t.status != TaskStatus.DONE for t in siblings):
+        return None
+    repo_path = Path(project.path)
+    registered = {wt["path"].name: wt for wt in git_ops.list_worktrees(repo_path)}
+    entry = _Entry(name=path.name, path=path, git=registered.get(path.name), kind="task",
+                   task_id=task.id, task=task)
+    base = branches.base_branch(project, git_ops.current_branch(repo_path))
+    item = _describe(entry, _probe(repo_path, entry, base, sizes=False), processes_in(path, cwd_processes()))
+    if not item["safe"]:
+        return None
+    return {**item, "dropped_branch": _remove(project, item, claude_json_path)}
 
 
 def autoclean(store, project: Project, now: datetime, days: int,

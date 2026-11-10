@@ -1,7 +1,7 @@
 import { forwardRef, useId } from "react";
 import { Check, ChevronDown } from "lucide-react";
 import { cn } from "../lib/cn";
-import { fieldBase, focusRing } from "./tokens";
+import { fieldBase, focusRing, textBox } from "./tokens";
 
 export const Input = forwardRef<HTMLInputElement, React.InputHTMLAttributes<HTMLInputElement>>(
   function Input({ className, ...rest }, ref) {
@@ -14,6 +14,51 @@ export const Textarea = forwardRef<HTMLTextAreaElement, React.TextareaHTMLAttrib
     return <textarea ref={ref} className={cn(fieldBase, "resize-y py-1.5 leading-relaxed", className)} {...rest} />;
   },
 );
+
+interface AutoGrowProps extends Omit<React.TextareaHTMLAttributes<HTMLTextAreaElement>, "value"> {
+  value: string;
+  /** Classes of the outer grid, for example the margin. The field's own classes go to `className`. */
+  wrapperClassName?: string;
+  /** The least height in px (the height a text had in view mode, so that a short one does not collapse). */
+  minHeight?: number;
+}
+
+/**
+ * A text field that grows with its text, with no inner scrollbar.
+ *
+ * The trick is a CSS grid mirror: a hidden element holding the same text sits in the same grid cell as
+ * the textarea, and the cell takes the height of the taller one. Nothing is measured, so there is no
+ * `height: auto` reset that would collapse the field for a frame and move the scroll container (the
+ * very jump this exists to remove), and it works in jsdom. The trailing space keeps the last empty
+ * line of a text that ends with a newline, and an empty field is as tall as its placeholder.
+ */
+export const AutoGrowTextarea = forwardRef<HTMLTextAreaElement, AutoGrowProps>(function AutoGrowTextarea(
+  { value, className, wrapperClassName, minHeight, style, ...rest },
+  ref,
+) {
+  const shared = cn(textBox, "col-start-1 row-start-1 min-w-0", className);
+  const floor = minHeight ? { minHeight } : undefined;
+  return (
+    <div className={cn("grid", wrapperClassName)}>
+      {/* The text lives in an attribute and is drawn by ::after, so the page holds it only once:
+         find-in-page and screen readers see the field, not a copy. */}
+      <div
+        aria-hidden
+        data-autogrow-mirror={(value === "" ? (rest.placeholder ?? "") : value) + " "}
+        className={cn(shared, "pointer-events-none invisible border-transparent after:content-[attr(data-autogrow-mirror)]")}
+        style={floor}
+      />
+      <textarea
+        ref={ref}
+        rows={1}
+        value={value}
+        className={cn(fieldBase, shared, "block resize-none overflow-hidden")}
+        style={{ ...floor, ...style }}
+        {...rest}
+      />
+    </div>
+  );
+});
 
 /**
  * Native `<select>` in its own "box": we deliberately do not build a custom dropdown —

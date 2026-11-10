@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+from tests.fakes import any_agent, to_work
 
 
 def iso(delta: timedelta) -> str:
@@ -59,15 +60,15 @@ def test_patch_other_field_with_expired_window_is_ok(client, repo, project):
 
 def test_move_to_todo_with_expired_window_is_rejected(client, repo, project):
     t = repo.add_task(project.id, "A", "x", start_after=iso(timedelta(hours=-3)), start_before=iso(timedelta(hours=-1)))
-    r = client.patch(f"/api/tasks/{t.id}", json={"status": "todo"})
+    r = client.patch(f"/api/tasks/{t.id}", json=to_work(client))
     assert r.status_code == 400 and "start window" in r.json()["detail"]
     # The same PATCH can both adjust the window and send the task to work
-    r = client.patch(f"/api/tasks/{t.id}", json={"status": "todo", "start_after": None, "start_before": None})
+    r = client.patch(f"/api/tasks/{t.id}", json={**to_work(client), "start_after": None, "start_before": None})
     assert r.status_code == 200 and r.json()["status"] == "todo"
 
 
 def test_retry_with_expired_window_is_rejected(client, repo, project):
-    t = repo.add_task(project.id, "A", "x", status="failed",
+    t = repo.add_task(project.id, "A", "x", status="failed", agent_id=any_agent(client),
                       start_after=iso(timedelta(hours=-3)), start_before=iso(timedelta(hours=-1)))
     r = client.post(f"/api/tasks/{t.id}/retry")
     assert r.status_code == 400 and "start window" in r.json()["detail"]

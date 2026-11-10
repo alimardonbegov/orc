@@ -4,13 +4,13 @@ from datetime import datetime, timedelta, timezone
 from orc.prompt import DEFAULT_TEMPLATE, build_prompt
 from orc.quota import (DEFAULT_QUOTA_PATTERNS, RESET_BUFFER_SEC, is_quota_error,
                        reset_retry_at, retry_delay_minutes)
-from orc.report import REPORT_REL_PATH, Report, read_report
+from orc.handoff import REPORT_REL_PATH, Report, read_report
 from orc.verify import run_verify
 
 
 def test_build_prompt_substitutes_and_keeps_braces_in_description():
     text = build_prompt(DEFAULT_TEMPLATE, title="T", description="code {x: 1}", branch="orc/task-1",
-                        target_branch="dev", verify_cmd="pytest", report_path=".orchestrator/report.json")
+                        target_branch="dev", verify_cmd="pytest")
     assert "# Task: T" in text
     assert "code {x: 1}" in text
     assert "orc/task-1" in text and "dev" in text and "pytest" in text
@@ -19,7 +19,7 @@ def test_build_prompt_substitutes_and_keeps_braces_in_description():
 
 def test_build_prompt_unknown_placeholder_is_kept():
     assert build_prompt("a {unknown} b", title="", description="", branch="", target_branch="",
-                        verify_cmd="", report_path="") == "a {unknown} b"
+                        verify_cmd="") == "a {unknown} b"
 
 
 def test_read_report(tmp_path):
@@ -59,10 +59,17 @@ def test_run_verify_runs_with_lowered_priority(tmp_path):
     import os
     from orc.verify import run_verify
     # The base nice depends on the environment (tests may run under nice), so we compare against it:
-    # the check must be at +10 relative to the parent.
+    # the check must be at +10 relative to the parent, up to the ceiling of the scale.
     base = os.getpriority(os.PRIO_PROCESS, 0)
     res = run_verify("ps -o nice= -p $$", tmp_path, 10)
-    assert res.ok and res.output.strip() == str(base + 10)
+    assert res.ok
+    got = int(res.output.strip())
+    if base + 10 <= 19:
+        assert got == base + 10
+    else:
+        # A parent that already runs at a high nice value hits the ceiling of the scale (19 on Linux,
+        # 20 on macOS): the child cannot be lowered further, only held at the ceiling.
+        assert got in (19, 20)
 
 
 def test_read_report_non_dict_json_returns_none(tmp_path):
@@ -216,25 +223,11 @@ def test_run_verify_leaves_foreign_pid_file_alone(tmp_path):
     assert pid_file.read_text().strip() == "999999"
 
 
-def test_build_prompt_template_json_braces_preserved():
-    """build_prompt(DEFAULT_TEMPLATE, ...) must preserve the single braces of the JSON example."""
-    text = build_prompt(
-        DEFAULT_TEMPLATE,
-        title="TestTask",
-        description="Do something",
-        branch="orc/fix-1",
-        target_branch="main",
-        verify_cmd="pytest tests/",
-        report_path=".orchestrator/report.json"
-    )
-
-    # The JSON example must have single braces
-    assert '{"status":' in text or '{ "status":' in text or '{\"status\":' in text, \
-        f"JSON not found or incorrectly escaped in the result:\n{text}"
-
-    # No double braces ({{ or }}) should remain
-    assert "{{" not in text, "Double opening braces remain"
-    assert "}}" not in text, "Double closing braces remain"
+def test_an_old_template_still_renders_its_report_block():
+    """A kept template may still order the report: it renders, and orc/handoff.py still reads the file."""
+    text = build_prompt('write {report_path}: {{"status": "success"}}', title="T", description="d", branch="b",
+                        target_branch="main", verify_cmd="pytest")
+    assert text == f'write {REPORT_REL_PATH}: {{"status": "success"}}'
 
 
 def _usage(resets_at, *, available=True, stale=False):
@@ -271,3 +264,13 @@ def test_reset_retry_at_matches_naive_now():
     now = datetime(2026, 1, 1, 12, 0)
     moment = reset_retry_at(now, _usage((now + timedelta(minutes=40)).astimezone().timestamp()))
     assert moment is not None and moment.tzinfo is None and moment > now
+
+
+def test_run_verify_does_not_ask_for_the_group_of_a_command_that_already_exited(tmp_path, monkeypatch):
+    """A command as quick as `true` can be gone before its group is asked for: that is not a failed check."""
+    import os
+
+    def gone(pid):
+        raise ProcessLookupError(3, "No such process")
+    monkeypatch.setattr(os, "getpgid", gone)
+    assert run_verify("true", tmp_path, 5).ok

@@ -5,6 +5,15 @@
   </picture>
 </p>
 
+<p align="center">
+  <b>English</b> ·
+  <a href="docs/readme/README.es.md">Español</a> ·
+  <a href="docs/readme/README.fr.md">Français</a> ·
+  <a href="docs/readme/README.de.md">Deutsch</a> ·
+  <a href="docs/readme/README.pt.md">Português</a> ·
+  <a href="docs/readme/README.ru.md">Русский</a>
+</p>
+
 # orc
 
 **A task queue for Claude Code.** orc runs every task in its own git worktree with
@@ -40,7 +49,9 @@ the result in the morning.
 ## Features
 
 - **Kanban board** with Backlog, To do, In progress and Done. Everything that needs you (a
-  question, a failure, a conflict) gathers in a "Waiting for me" strip above the board.
+  question, a failure, a conflict) gathers in a "Waiting for me" strip above the board. Select several
+  cards to change their status, priority, agent or labels at once, or archive them, and save a set of
+  filters as a named view.
 - **Auto-dispatcher.** You do not start tasks one by one: every 30 seconds (configurable)
   the dispatcher picks up tasks from "To do", within per-project and global worker limits
   and task dependencies. "Run now" triggers a pass without waiting for the timer.
@@ -52,11 +63,24 @@ the result in the morning.
   you.
 - **Questions and live replies.** Permission requests, multiple-choice questions and plan
   approvals show up on the card; your answer goes into the same running session, usually
-  within seconds. You can also send a note to a running session at any time.
+  within seconds. You can also send a message to a running session at any time.
 - **Scheduled start.** "Not before" and an optional "Not after" time; a waiting task does
   not hold a worker slot.
 - **Recurring routines.** An instruction plus a schedule (every N minutes, hours or days,
-  or cron). Every run becomes an ordinary task with its own card, report and token count.
+  or cron). Every run becomes an ordinary task with its own card, summary and token count.
+  Routines have their own page in the left column and need no project: without one, each run is
+  a chat with the agent.
+- **Agents.** Save a model, effort, permission mode and an optional prompt under a name and an
+  avatar, then allocate tasks and routines to it instead of setting parameters by hand. An agent
+  does not belong to a project: it can work in all of them or be limited to one, and can keep its
+  own memory across projects.
+- **Chats and project leads.** Talk to an agent directly in a private worktree, where nothing is
+  merged. A project's lead, appointed from the project's or the agent's settings, sees the board and
+  proposes tasks, which reach the backlog only with your approval. See [docs/internals/agents.md](docs/internals/agents.md).
+- **Agents that plan work.** A session, a chat or a project lead can split a large feature into linked
+  cards with `orc task add`, `batch` and `link`, order them with dependencies and stages, hand in files,
+  go to sleep with `orc task wakeup` until a time or another card is done, and be woken when all their
+  subtasks finish. The dispatcher runs the chain by itself. See [docs/agent-tasks.md](docs/agent-tasks.md).
 - **Token and quota tracking.** Each card shows the tokens of all its sessions and
   subagents, read from Claude Code transcripts. The sidebar shows your account's 5-hour
   and weekly limits. When a session hits the usage limit, the dispatcher pauses and
@@ -68,21 +92,23 @@ the result in the morning.
   mode, the distribution of task durations and the most expensive tasks.
 - **Branch management from the UI.** Create, rename and delete branches; operations that
   would break running work are blocked with an explanation.
-- **Rich task cards:** model, effort and permission mode per task, a target branch,
-  dependencies on other tasks, and screenshots pasted right into the assignment.
+- **Rich task cards:** the assignment with screenshots pasted right into it, one
+  conversation with the agent, a target branch, labels and planning dates, dependencies and
+  subtasks with a dependency tree, and an execution log with every run, check and merge.
 - **Six interface languages:** English, Spanish, French, German, Portuguese and Russian.
   Light and dark themes.
 
 ## How it works
 
 1. **Add a project:** the path to a git repository, a `verify_cmd` and a worker limit.
-2. **Create a task card,** write the assignment in "Task for the agent" and move the card
-   to "To do".
+2. **Create an agent and a task card:** write the assignment in "Task for the agent", assign the
+   agent and move the card to "To do". An unassigned card stays with you: it does not go to work.
 3. **The dispatcher picks it up:** it creates a worktree on a new branch `orc/task-N` from
    the task's target branch and starts `claude --bg` there with the assignment.
-4. **Report and verify:** when the session ends, orc reads its report and runs
-   `verify_cmd` in the worktree. A failure goes back to the same session once; a second
-   failure marks the task as failed.
+4. **Hand-in and verify:** the agent ends its work with `orc task done` (or
+   `orc task fail`), and orc runs `verify_cmd` in the worktree. A failure goes back to the
+   same session once; a second failure marks the task as failed. An agent that stops
+   without handing in leaves the card waiting for you, with "Accept the work" at hand.
 5. **Merge:** passing tasks are merged FIFO with `git merge --no-ff`, at most one per
    dispatcher pass. If the target branch is checked out in your main working copy, orc
    first commits your tracked changes there as a separate `wip(orc)` commit.
@@ -90,7 +116,8 @@ the result in the morning.
    target branch into its own branch, resolves the conflict by meaning, passes
    verification again and goes to the back of the merge queue.
 7. **Questions:** if a session asks something, the card gets a "waiting for reply" badge
-   and your answer is delivered into the same live session, without a restart.
+   and your answer, typed in the card's conversation, is delivered into the same live
+   session, without a restart.
 
 The full walkthrough, including the merge rules and edge cases, is in
 [docs/how-it-works.md](docs/how-it-works.md).
@@ -186,6 +213,7 @@ install, `orc` is on your `PATH`.
 | `orc doctor` | Checks the environment without calling a model or creating anything. Exits with 1 if something blocks the dispatcher. |
 | `orc tick` | Runs one dispatcher pass without the server, prints the dispatcher status and exits. Do not run it while `orc serve` is running: there is no lock between processes. |
 | `orc db-path` | Prints the path to the database. |
+| `orc task add\|batch\|link\|context\|guide\|install-skill` | Creates and links cards on the board of the running server, for agents and scripts: see [Agents creating tasks](docs/agent-tasks.md). |
 
 ## Security
 
@@ -230,10 +258,17 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Documentation
 
+- [Agents creating tasks](docs/agent-tasks.md): letting a session put cards on the board,
+  linked into a chain on one base branch.
 - [How orc works](docs/how-it-works.md): the full flow, the merge queue, conflict
   resolution and edge cases.
+- [Agents, leads, chats and memory](docs/internals/agents.md): how agents are resolved, what
+  a chat is allowed to touch and how the optional memory works.
 - [Installing from a wheel](docs/install.md).
-- Internals: [input requests](docs/internals/input-requests.md),
+- Internals: [task cards](docs/internals/task-cards.md),
+  [input requests](docs/internals/input-requests.md),
+  [handing in the work](docs/internals/handoff.md),
+  [the execution log](docs/internals/execution-log.md),
   [message delivery](docs/internals/message-delivery.md),
   [plan mode](docs/internals/plan-mode.md).
 - Design: [UI design decisions](docs/design/ui-design.md), [brand](docs/design/brand.md).

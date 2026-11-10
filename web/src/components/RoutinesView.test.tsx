@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { it, expect, vi, beforeEach } from "vitest";
 import { RoutinesView } from "./RoutinesView";
 import { api } from "../api";
-import type { Project, Routine, RoutineRun } from "../types";
+import { AgentsContext } from "../agents";
+import type { Agent, Project, Routine, RoutineRun } from "../types";
 
 vi.mock("../api", async () => {
   const actual = await vi.importActual<typeof import("../api")>("../api");
@@ -23,27 +24,34 @@ const project = {
 } as Project;
 
 const lastRun: RoutineRun = {
-  task_id: 42, run: 3, title: "Report · #3", status: "done", blocker: null, blocker_detail: null,
+  task_id: 42, chat_id: null, run: 3, title: "Report · #3", status: "done", blocker: null, blocker_detail: null,
   created_at: "2026-10-07T11:00:00+00:00", started_at: "2026-10-07T11:00:10+00:00",
   done_at: "2026-10-07T11:04:10+00:00", updated_at: "2026-10-07T11:04:10+00:00", archived_at: null,
   report: { status: "success", summary: "three dependencies are outdated" }, tokens: 12_500,
 };
 
 const routine = (over: Partial<Routine> = {}): Routine => ({
-  id: 7, project_id: 1, title: "Report", description: "do A, B, C", priority: "normal", model: null, effort: null,
-  permission_mode: null, verify_cmd: null, target_branch: null, schedule_kind: "interval", interval_minutes: 60,
+  id: 7, project_id: 1, title: "Report", description: "do A, B, C", priority: "normal",
+  verify_cmd: null, target_branch: null, schedule_kind: "interval", interval_minutes: 60,
   cron: null, timezone: "UTC", enabled: true, next_run_at: new Date(Date.now() + 30 * 60_000).toISOString(),
   last_run_at: lastRun.created_at, run_count: 3, skipped_count: 1, max_runs: null, archive_runs: true,
   schedule_text: "every hour", stats: { total: 3, done: 2, failed: 1, active: 0, skipped: 1 }, last_run: lastRun,
   created_at: "2026-10-01T00:00:00+00:00", updated_at: "2026-10-07T11:00:00+00:00", ...over,
 });
 
-const mount = (list: Routine[]) => {
+const mount = (list: Routine[], scope: Project | null = project, agents: Agent[] = []) => {
   vi.mocked(api.routines).mockResolvedValue(list);
-  const props = { onOpenTask: vi.fn(), onTasksChanged: vi.fn() };
-  render(<RoutinesView project={project} canCreate {...props} />);
+  const props = { onOpenTask: vi.fn(), onOpenChat: vi.fn(), onTasksChanged: vi.fn() };
+  render(
+    <AgentsContext.Provider value={agents}>
+      <RoutinesView project={scope} projects={[project]} canCreate {...props} />
+    </AgentsContext.Provider>,
+  );
   return props;
 };
+
+const agent = { id: 5, name: "Ann", description: "", avatar: null, project_id: null } as Agent;
+const chatRun: RoutineRun = { ...lastRun, task_id: null, chat_id: 90, run: 1, status: "done", report: null };
 
 beforeEach(() => vi.clearAllMocks());
 
@@ -64,7 +72,7 @@ it("shows the schedule, counters and the last run; a click opens its card", asyn
 });
 
 it("\"Run now\" creates a run and refreshes the board", async () => {
-  vi.mocked(api.runRoutine).mockResolvedValue({ task_id: 43, routine: routine() });
+  vi.mocked(api.runRoutine).mockResolvedValue({ task_id: 43, chat_id: null, routine: routine() });
   const props = mount([routine()]);
   await userEvent.click(await screen.findByRole("button", { name: "Run now" }));
   expect(api.runRoutine).toHaveBeenCalledWith(7);
@@ -137,4 +145,54 @@ it("too frequent an interval is not sent to the server", async () => {
   await userEvent.type(every, "2");
   expect(await screen.findByText("Interval must be at least 5 minutes")).toBeInTheDocument();
   expect(screen.getByRole("button", { name: "Create routine" })).toBeDisabled();
+});
+
+it("the Routines page lists every routine and says whose it is", async () => {
+  mount([routine(), routine({ id: 8, project_id: null, title: "Digest", agent_id: 5, last_run: chatRun })], null);
+  const free = (await screen.findByText("Digest")).closest("article")!;
+  expect(within(free).getByText("No project")).toBeInTheDocument();
+  expect(vi.mocked(api.routines)).toHaveBeenCalledWith(undefined);
+  expect(within((await screen.findByText("Report")).closest("article")!).getByText("demo")).toBeInTheDocument();
+});
+
+it("a run of a routine outside a project opens its chat, not a card", async () => {
+  vi.mocked(api.routineRuns).mockResolvedValue([chatRun]);
+  const props = mount([routine({ id: 8, project_id: null, title: "Digest", agent_id: 5, last_run: chatRun })], null);
+  await userEvent.click(await screen.findByRole("button", { name: "Run history of Digest" }));
+  await userEvent.click((await screen.findAllByRole("row"))[1]);
+  expect(props.onOpenChat).toHaveBeenCalledWith(90);
+  expect(props.onOpenTask).not.toHaveBeenCalled();
+});
+
+it("the page form creates a routine without a project and needs an agent", async () => {
+  vi.mocked(api.previewSchedule).mockResolvedValue({ next: [], text: "" });
+  vi.mocked(api.addRoutine).mockResolvedValue(routine({ project_id: null }));
+  mount([], null, [agent]);
+  await userEvent.click((await screen.findAllByRole("button", { name: "Routine" }))[0]);
+  expect(screen.getByRole("combobox", { name: "Project" })).toHaveValue("");
+  await userEvent.type(screen.getByPlaceholderText("Morning dependency check"), "Digest");
+  await userEvent.type(screen.getByRole("textbox", { name: "Instruction" }), "read the news");
+  const submit = screen.getByRole("button", { name: "Create routine" });
+  await waitFor(() => expect(submit).toBeDisabled()); // no agent yet
+  expect(screen.queryByText("Verify command")).not.toBeInTheDocument(); // card-only parameters are gone
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Agent" }), "5");
+  await waitFor(() => expect(submit).toBeEnabled());
+  await userEvent.click(submit);
+  await waitFor(() => expect(api.addRoutine).toHaveBeenCalled());
+  expect(vi.mocked(api.addRoutine).mock.calls[0][0]).toMatchObject({
+    project_id: null, agent_id: 5, verify_cmd: null, title: "Digest" });
+});
+
+it("editing a routine can detach it from its project", async () => {
+  vi.mocked(api.previewSchedule).mockResolvedValue({ next: [], text: "" });
+  vi.mocked(api.patchRoutine).mockResolvedValue(routine({ project_id: null }));
+  mount([routine({ agent_id: 5 })], project, [agent]);
+  await userEvent.click(await screen.findByRole("button", { name: "Edit" }));
+  const select = screen.getByRole("combobox", { name: "Project" });
+  expect(select).toHaveValue("1");
+  await userEvent.selectOptions(select, "");
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Agent" }), "5");
+  await userEvent.click(screen.getByRole("button", { name: "Save" }));
+  await waitFor(() => expect(api.patchRoutine).toHaveBeenCalled());
+  expect(vi.mocked(api.patchRoutine).mock.calls[0][1]).toMatchObject({ project_id: null, agent_id: 5 });
 });

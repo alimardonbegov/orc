@@ -7,6 +7,9 @@ import re
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
+
+from orc import session_input
 
 JOB_ID_RE = re.compile(r"\b[0-9a-f]{8}\b")
 # The launch confirmation line (per the spike results): "backgrounded · <id> · <name>"
@@ -43,16 +46,19 @@ class JobState:
     # a turn (`absorbed_mid_turn`) is not subtracted from it by the daemon.
     queued: int = 0
     # How much of `in_flight` is alarms (`TIMER_IN_FLIGHT_KINDS`): the session's ScheduleWakeup/cron.
-    # They will wake the session, but there is no work behind them, so they are no reason to distrust the turn's report.
+    # They will wake the session, but there is no work behind them, so they are no reason to distrust the turn's handoff.
     timers: int = 0
+    # What the session has going on according to the daemon (`fan` in state.json): subagents, background
+    # commands and the todo list. For the activity view only (orc/activity.py), decisions do not rest on it.
+    fan: tuple = ()
 
     @property
     def only_timers(self) -> bool:
         """The turn ended, and the session has only alarms in the background that it set itself.
 
         This does not count as waiting for a human (`waiting`): the harness will wake the session. But there is
-        also no background work behind them whose result could change the report: the agent sets
-        ScheduleWakeup as a spare alarm and hands in its report before it fires. The daemon
+        also no background work behind them whose result could change the handoff: the agent sets
+        ScheduleWakeup as a spare alarm and hands in its work before it fires. The daemon
         keeps the alarm in `inFlight`, and in /loop mode also re-arms a keepalive, so
         the dispatcher's silence ceiling is never reached.
         """
@@ -64,7 +70,7 @@ class JobState:
 
         Before Claude Code 2.1.292 the daemon wrote the end of a background session's turn into `state`: `done` or
         `blocked` (by text). Since 2.1.293 neither exists: `state` stays "working",
-        and `tempo` becomes "idle" (tasks that handed in a report used to hang "in progress").
+        and `tempo` becomes "idle" (tasks that handed in their work used to hang "in progress").
         In the middle of a turn, including during a long command, `tempo` stays "active".
         """
         return self.state == "blocked" or (self.state == "working" and self.tempo == "idle")
@@ -77,8 +83,8 @@ class JobState:
         `working` + `tempo == "blocked"` (or a non-empty `needs`): the agent is stuck on an
         interactive dialog: a permission, a question with options, plan approval.
 
-        The end of a turn is not necessarily a question: it can also be the final report. The dispatcher tells them apart by
-        the report.json written in that turn. The daemon also sets `blocked` BY TEXT, and
+        The end of a turn is not necessarily a question: it can also be the final message. The dispatcher tells them apart by
+        the `orc task done` called in that turn (orc/handoff.py). The daemon also sets `blocked` BY TEXT, and
         a reply to a subagent ("please make one more fix before the re-review") looks to it
         exactly like a question to a human. So with live background work we do not count the end of a turn
         as waiting: the subagent's report will wake it.
@@ -121,7 +127,7 @@ def _counter(value: object) -> int:
 # Kinds of background work (`inFlight.kinds`) that do not wake the session on their own. `artifact_watch` is
 # a subscription to comments on a published artifact: it hangs in `tasks` until the end of the session's life,
 # and only a human's comment wakes it, i.e. the same reply. Since Claude Code 2.1.293 the end of a
-# turn is working + idle without `done`, and because of this subscription a task that handed in a report together with an
+# turn is working + idle without `done`, and because of this subscription a task that handed in its work together with an
 # artifact hung "in progress" until the IN_FLIGHT_STALE_SEC ceiling.
 PASSIVE_IN_FLIGHT_KINDS = frozenset({"artifact_watch"})
 # `inFlight` fields that do not add up to background work: the message queue is a separate
@@ -214,12 +220,14 @@ class ClaudeCli:
 
     def start_bg(self, cwd: Path, prompt: str, name: str, model: str | None = None,
                  effort: str | None = None, permission_mode: str = "auto",
-                 settings: str | None = None) -> str:
+                 settings: str | None = None, append_system_prompt: str | None = None) -> str:
         args = ["--bg", "--name", name, "--permission-mode", permission_mode]
+        if append_system_prompt:
+            # The agent's prompt (orc/agents.py). It lands in the session's saved options, like --settings.
+            args += ["--append-system-prompt", append_system_prompt]
         if settings:
             # Message delivery hooks (orc/inbox.py). They travel as a JSON string, not as a file in
-            # the user's repository, and end up in the session's saved options; resume_bg
-            # picks them up itself, so the flag is not needed there.
+            # the user's repository.
             args += ["--settings", settings]
         if model:
             args += ["--model", model]
@@ -228,21 +236,47 @@ class ClaudeCli:
         args.append(prompt)
         return parse_job_id(self._run(args, cwd))
 
-    def resume_bg(self, cwd: Path, session_id: str, prompt: str, settings: str | None = None) -> str:
+    def resume_bg(self, cwd: Path, session_id: str, prompt: str, settings: str | None = None,
+                  append_system_prompt: str | None = None, name: str | None = None, model: str | None = None,
+                  effort: str | None = None, permission_mode: str | None = None) -> str:
         # Without a session_id there is nothing to resume: previously None went straight into subprocess.run and failed
         # with an obscure TypeError already inside the standard library.
         if not session_id:
             raise ClaudeCliError("resume without a session_id: the session is not known yet, nothing to resume")
         args = ["--bg", "--resume", session_id]
+        # A resume without flags depends on timing: once the daemon has settled the stopped job it wakes the
+        # same job with its saved options, but until then (a second or so after `state: stopped`) it starts a
+        # COPY with none of them: no hooks, no permission mode, no prompt, and the model falls back to the
+        # default. With flags the result is always a copy that carries exactly what we pass (spike on 2.1.319,
+        # see docs/internals/message-delivery.md). So callers that continue a task pass the full set.
+        if name:
+            args += ["--name", name]
+        if permission_mode:
+            args += ["--permission-mode", permission_mode]
         if settings:
-            # A session that reached done/failed is still "running" for the daemon, and a resume creates
-            # a COPY without saved options, i.e. without hooks (spike 2026-09-21). The daemon accepts flags for a copy,
-            # so we pass the hooks again. For a stopped session
-            # we do NOT pass settings: the daemon wakes it with the saved options, and the flags would turn
-            # the wake-up into a copy.
             args += ["--settings", settings]
+        if append_system_prompt:
+            args += ["--append-system-prompt", append_system_prompt]
+        if model:
+            args += ["--model", model]
+        if effort:
+            args += ["--effort", effort]
         # A positional prompt together with --resume: verified by a live spike
         return parse_job_id(self._run([*args, prompt], cwd))
+
+    def send_input(self, job_id: str, text: str, interrupt: bool, confirm: Callable[[], bool]) -> bool:
+        """Type a message into a live session. True means `confirm` saw it arrive. See orc/session_input.py."""
+        try:
+            return session_input.type_message(self.bin, job_id, text, interrupt, confirm)
+        except session_input.SessionInputError as e:
+            raise ClaudeCliError(str(e))
+
+    def send_interrupt(self, job_id: str) -> None:
+        """Esc in a live session: the current action stops, the session stays."""
+        try:
+            session_input.press_interrupt(self.bin, job_id)
+        except session_input.SessionInputError as e:
+            raise ClaudeCliError(str(e))
 
     def stop(self, job_id: str) -> None:
         self._run(["stop", job_id])
@@ -281,6 +315,7 @@ class ClaudeCli:
             in_flight=_in_flight(data.get("inFlight")),
             queued=_queued(data.get("inFlight")),
             timers=_timers(data.get("inFlight")),
+            fan=tuple(x for x in data["fan"] if isinstance(x, dict)) if isinstance(data.get("fan"), list) else (),
         )
 
     def _transcript_path(self, data: dict) -> str | None:

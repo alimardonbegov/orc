@@ -70,6 +70,8 @@ For a larger change, please open an issue first to agree on the approach.
 
 - Code comments, docstrings and commit messages are in English.
 - Names of classes, variables and functions are in English.
+- The README has short translations in `docs/readme/` (the languages of the interface). When you change the
+  English README's overview, features or quick start, update them too, or say in the pull request that they lag.
 - `.editorconfig` sets the basics: UTF-8, LF, a final newline, 4 spaces in Python and 2 in
   TypeScript, JSON, YAML, CSS and HTML.
 - The web UI is linted with `npm run lint` (oxlint) and type-checked as part of

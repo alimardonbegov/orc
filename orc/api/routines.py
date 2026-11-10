@@ -6,13 +6,13 @@ import json
 from dataclasses import asdict
 
 from fastapi import APIRouter, HTTPException, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from orc import projects, recurrence, routines
 from orc.api.common import (
-    _check_branch_exists, _check_description_for_work, _check_mode, _dispatcher, _repo,
+    _check_agent, _check_branch_exists, _check_description_for_work, _dispatcher, _repo,
 )
-from orc.models import Routine, TaskStatus
+from orc.models import Chat, Routine, Task, TaskStatus
 from orc.util import utc_now
 
 router = APIRouter()
@@ -21,15 +21,16 @@ PRIORITIES = {"high", "normal", "low"}
 
 
 class RoutineIn(BaseModel):
-    project_id: int
+    # A card or a routine holds no model, effort or permission mode: a caller that still sends them
+    # must hear it, not get a run that quietly uses other parameters
+    model_config = ConfigDict(extra="forbid")
+    project_id: int | None = None  # None: a routine outside any project, its runs are chats
     title: str = Field(min_length=1)
     description: str = ""
     priority: str = "normal"
-    model: str | None = None
-    effort: str | None = None
-    permission_mode: str | None = None
     verify_cmd: str | None = None
     target_branch: str | None = None
+    agent_id: int | None = None
     schedule_kind: str = "interval"
     interval_minutes: int | None = None
     cron: str | None = None
@@ -40,14 +41,17 @@ class RoutineIn(BaseModel):
 
 
 class RoutinePatch(BaseModel):
+    # A card or a routine holds no model, effort or permission mode: a caller that still sends them
+    # must hear it, not get a run that quietly uses other parameters
+    model_config = ConfigDict(extra="forbid")
+    # Sent explicitly: a project id moves the routine there, null detaches it (its runs become chats)
+    project_id: int | None = None
     title: str | None = Field(default=None, min_length=1)
     description: str | None = None
     priority: str | None = None
-    model: str | None = None
-    effort: str | None = None
-    permission_mode: str | None = None
     verify_cmd: str | None = None
     target_branch: str | None = None
+    agent_id: int | None = None
     schedule_kind: str | None = None
     interval_minutes: int | None = None
     cron: str | None = None
@@ -64,6 +68,12 @@ class SchedulePreviewIn(BaseModel):
     timezone: str | None = None
 
 
+# Run parameters that only a card in a project has: a run in a chat takes everything from its agent
+PROJECT_ONLY_FIELDS = ("verify_cmd", "target_branch")
+# A chat has no board column, so its status is shown as the task status that means the same
+CHAT_AS_TASK_STATUS = {"idle": TaskStatus.DONE, "queued": TaskStatus.TODO, "running": TaskStatus.IN_PROGRESS,
+                       "waiting": TaskStatus.IN_PROGRESS}
+
 SCHEDULE_FIELDS = ("schedule_kind", "interval_minutes", "cron", "timezone")
 
 
@@ -72,6 +82,14 @@ def _check_schedule(kind: str, interval_minutes: int | None, cron: str | None, t
         recurrence.check(kind, interval_minutes, cron, tz)
     except ValueError as e:
         raise HTTPException(400, str(e))
+
+
+def _check_no_project_fields(values: dict) -> None:
+    """A routine outside a project: its run is a chat, so the card-only parameters have nowhere to go."""
+    for key in PROJECT_ONLY_FIELDS:
+        if values.get(key):
+            raise HTTPException(400, f"{key}: not applicable to a routine outside a project "
+                                     f"(the agent's own settings apply)")
 
 
 def _check_priority(priority: str | None) -> None:
@@ -87,7 +105,7 @@ def _routine_or_404(request: Request, routine_id: int) -> Routine:
 
 
 def _report_summary(raw: str | None) -> dict | None:
-    """A run's report (report.json) already as an object. A broken one gives None: it must not break the list."""
+    """A run's report (tasks.report_json, orc/handoff.py) already as an object. A broken one gives None: it must not break the list."""
     if not raw:
         return None
     try:
@@ -109,7 +127,7 @@ def _tokens(raw: str | None) -> int | None:
 def _run_out(task, started_at: str | None) -> dict:
     """A run in the routine history: exactly what a table row needs, without the conversation and sessions."""
     return {
-        "task_id": task.id, "run": task.routine_run, "title": task.title, "status": task.status,
+        "task_id": task.id, "chat_id": None, "run": task.routine_run, "title": task.title, "status": task.status,
         "blocker": task.blocker, "blocker_detail": task.blocker_detail,
         "created_at": task.created_at, "started_at": started_at, "done_at": task.done_at,
         "updated_at": task.updated_at, "archived_at": task.archived_at,
@@ -117,7 +135,29 @@ def _run_out(task, started_at: str | None) -> dict:
     }
 
 
-def _routine_out(routine: Routine, stats: dict[str, int] | None, last, started_at: str | None) -> dict:
+def _chat_run_out(chat) -> dict:
+    """A run of a routine outside a project, in the same shape as a card's run: the history table is shared."""
+    status = CHAT_AS_TASK_STATUS.get(chat.status, TaskStatus.TODO)
+    return {
+        "task_id": None, "chat_id": chat.id, "run": chat.routine_run, "title": chat.title, "status": status,
+        "blocker": None, "blocker_detail": None,
+        "created_at": chat.created_at, "started_at": chat.turn_started_at or chat.created_at,
+        "done_at": chat.updated_at if status == TaskStatus.DONE else None,
+        "updated_at": chat.updated_at, "archived_at": None,
+        "report": None, "tokens": _tokens(chat.usage_json),
+    }
+
+
+def _chat_stats(by_chat_status: dict[str, int] | None) -> dict[str, int]:
+    """Chat counters by chat status → the same keys as for cards, so _routine_out counts them alike."""
+    out: dict[str, int] = {}
+    for status, n in (by_chat_status or {}).items():
+        key = CHAT_AS_TASK_STATUS.get(status, TaskStatus.TODO)
+        out[key] = out.get(key, 0) + n
+    return out
+
+
+def _routine_out(routine: Routine, stats: dict[str, int] | None, last_run: dict | None) -> dict:
     stats = stats or {}
     active = sum(stats.get(s, 0) for s in routines.ACTIVE_RUN_STATUSES)
     return {
@@ -129,25 +169,37 @@ def _routine_out(routine: Routine, stats: dict[str, int] | None, last, started_a
             "failed": stats.get(TaskStatus.FAILED, 0), "active": active,
             "skipped": routine.skipped_count,
         },
-        "last_run": _run_out(last, started_at) if last is not None else None,
+        "last_run": last_run,
     }
 
 
 def _routine_view(request: Request, routine: Routine) -> dict:
     repo = _repo(request)
+    if routine.project_id is None:
+        chat = repo.last_routine_chats().get(routine.id)
+        return _routine_out(routine, _chat_stats(repo.routine_chat_stats().get(routine.id)),
+                            _chat_run_out(chat) if chat else None)
     last = repo.last_routine_runs().get(routine.id)
-    return _routine_out(routine, repo.routine_run_stats().get(routine.id), last,
-                        repo.first_session_time(last.id) if last else None)
+    return _routine_out(routine, repo.routine_run_stats().get(routine.id),
+                        _run_out(last, repo.first_session_time(last.id)) if last else None)
 
 
 @router.get("/routines")
 def list_routines(request: Request, project_id: int | None = None):
+    """Routines of one project, or all of them (those outside any project included) without project_id."""
     repo = _repo(request)
-    stats = repo.routine_run_stats()
-    last = repo.last_routine_runs()
+    stats, chat_stats = repo.routine_run_stats(), repo.routine_chat_stats()
+    last, last_chats = repo.last_routine_runs(), repo.last_routine_chats()
     starts = repo.first_session_times()
-    return [_routine_out(r, stats.get(r.id), last.get(r.id), starts.get(last[r.id].id) if r.id in last else None)
-            for r in repo.list_routines(project_id)]
+    out = []
+    for r in repo.list_routines(project_id):
+        if r.project_id is None:
+            chat = last_chats.get(r.id)
+            out.append(_routine_out(r, _chat_stats(chat_stats.get(r.id)), _chat_run_out(chat) if chat else None))
+        else:
+            run = last.get(r.id)
+            out.append(_routine_out(r, stats.get(r.id), _run_out(run, starts.get(run.id)) if run else None))
+    return out
 
 
 @router.post("/routines/preview")
@@ -163,19 +215,26 @@ def preview_schedule(body: SchedulePreviewIn):
 @router.post("/routines", status_code=201)
 def add_routine(body: RoutineIn, request: Request):
     repo = _repo(request)
-    project = repo.get_project(body.project_id)
-    if project is None:
-        raise HTTPException(400, "project not found")
-    try:
-        projects.check_available(project)
-    except projects.ProjectPathError as e:
-        raise HTTPException(409, str(e))
+    project = None
+    if body.project_id is not None:
+        project = repo.get_project(body.project_id)
+        if project is None:
+            raise HTTPException(400, "project not found")
+        try:
+            projects.check_available(project)
+        except projects.ProjectPathError as e:
+            raise HTTPException(409, str(e))
+    elif body.agent_id is None:
+        # The run of a routine outside a project is a chat, and a chat is always with an agent
+        raise HTTPException(400, "agent_id: a routine outside a project needs an agent")
+    else:
+        _check_no_project_fields(body.model_dump())
     # Every run goes to the agent with this text: an empty task description means an empty scheduled session
     _check_description_for_work(body.description)
-    _check_mode(body.permission_mode)
+    _check_agent(repo, body.agent_id, body.project_id)
     _check_priority(body.priority)
     _check_schedule(body.schedule_kind, body.interval_minutes, body.cron, body.timezone)
-    if body.target_branch:
+    if body.target_branch and project is not None:
         _check_branch_exists(project.path, body.target_branch)
     fields = body.model_dump(exclude={"project_id", "title", "enabled", "archive_runs"})
     if body.schedule_kind == "interval":
@@ -202,13 +261,42 @@ def patch_routine(routine_id: int, body: RoutinePatch, request: Request):
     fields = body.model_dump(exclude_unset=True)
     if "description" in fields:
         _check_description_for_work(fields["description"])
-    _check_mode(fields.get("permission_mode"))
+    target_project_id = fields.get("project_id", routine.project_id)
+    if "project_id" in fields and fields["project_id"] == routine.project_id:
+        del fields["project_id"]
+    if "project_id" in fields:
+        # Attach, move or detach. Past runs stay where they were made (cards or chats); an unfinished
+        # run would be orphaned from the history the routine shows afterwards, so wait for it.
+        if routines.active_run(repo, routine_id) is not None:
+            raise HTTPException(409, "the routine has an unfinished run: wait for it before changing the project")
+        if target_project_id is not None:
+            project = repo.get_project(target_project_id)
+            if project is None:
+                raise HTTPException(400, "project not found")
+            try:
+                projects.check_available(project)
+            except projects.ProjectPathError as e:
+                raise HTTPException(409, str(e))
+        # Card-only parameters belong to the old project's repository: start clean unless sent anew
+        for key in PROJECT_ONLY_FIELDS:
+            fields.setdefault(key, None)
+        # The agent must still fit the new place: a project-internal agent does not follow to another
+        agent_id = fields.get("agent_id", routine.agent_id)
+        if target_project_id is None and agent_id is None:
+            raise HTTPException(400, "agent_id: a routine outside a project needs an agent")
+        _check_agent(repo, agent_id, target_project_id)
+    if target_project_id is None:
+        _check_no_project_fields(fields)
+        if "agent_id" in fields and fields["agent_id"] is None:
+            raise HTTPException(400, "agent_id: a routine outside a project needs an agent")
+    if "agent_id" in fields:
+        _check_agent(repo, fields["agent_id"], target_project_id)
     _check_priority(fields.get("priority"))
     for key in ("title", "schedule_kind", "enabled", "archive_runs", "priority"):
         if key in fields and fields[key] is None:
             raise HTTPException(400, f"{key}: null is not allowed")
     if fields.get("target_branch"):
-        project = repo.get_project(routine.project_id)
+        project = repo.get_project(target_project_id)
         if project is not None:
             _check_branch_exists(project.path, fields["target_branch"])
     merged = {k: fields.get(k, getattr(routine, k)) for k in SCHEDULE_FIELDS}
@@ -237,6 +325,10 @@ def patch_routine(routine_id: int, body: RoutinePatch, request: Request):
         # Enabling after a pause and changing the schedule count the slot from the current moment:
         # what was missed during the pause is not caught up.
         routine = repo.update_routine(routine_id, next_run_at=routines.next_slot(routine, utc_now()))
+    if "project_id" in fields:
+        repo.add_event(f"routine '{routine.title}' moved: "
+                       f"{'detached from the project' if routine.project_id is None else 'attached to a project'}",
+                       project_id=routine.project_id)
     if enabling:
         repo.add_event(f"routine '{routine.title}' resumed: {routines.describe(routine)}",
                        project_id=routine.project_id)
@@ -251,8 +343,8 @@ def delete_routine(routine_id: int, request: Request):
     repo = _repo(request)
     routine = _routine_or_404(request, routine_id)
     repo.delete_routine(routine_id)
-    repo.add_event(f"routine '{routine.title}' deleted, its runs stayed on the board as ordinary tasks",
-                   project_id=routine.project_id)
+    repo.add_event(f"routine '{routine.title}' deleted, its runs stayed as ordinary "
+                   f"{'chats' if routine.project_id is None else 'tasks'}", project_id=routine.project_id)
     return {"deleted": routine_id}
 
 
@@ -261,25 +353,29 @@ def run_routine(routine_id: int, request: Request):
     """Run now: an out-of-turn run, the schedule does not shift."""
     repo = _repo(request)
     routine = _routine_or_404(request, routine_id)
-    project = repo.get_project(routine.project_id)
+    project = repo.get_project(routine.project_id) if routine.project_id is not None else None
     if project is not None:
         try:
             projects.check_available(project)
         except projects.ProjectPathError as e:
             raise HTTPException(409, str(e))
     try:
-        task = _dispatcher(request).run_routine(routine_id)
+        run = _dispatcher(request).run_routine(routine_id)
     except routines.RunActive as e:
         raise HTTPException(409, str(e))
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"task_id": task.id, "routine": _routine_view(request, repo.get_routine(routine_id))}
+    return {"task_id": run.id if isinstance(run, Task) else None,
+            "chat_id": run.id if isinstance(run, Chat) else None,
+            "routine": _routine_view(request, repo.get_routine(routine_id))}
 
 
 @router.get("/routines/{routine_id}/runs")
 def routine_runs(routine_id: int, request: Request):
     """Run history of a routine, newest first, including those moved to the archive."""
     repo = _repo(request)
-    _routine_or_404(request, routine_id)
+    routine = _routine_or_404(request, routine_id)
+    if routine.project_id is None:
+        return [_chat_run_out(c) for c in repo.routine_chats(routine_id)]
     starts = repo.first_session_times()
     return [_run_out(t, starts.get(t.id)) for t in repo.routine_runs(routine_id)]

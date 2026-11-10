@@ -1,6 +1,8 @@
-import { attachmentUrl, parseDescription } from "../attachments";
+import { attachmentUrl, displaySegments } from "../attachments";
 import { cn } from "../lib/cn";
 import { useTranslation } from "../i18n";
+import { Linkified } from "./Linkified";
+import { Markdown } from "./Markdown";
 
 interface Props {
   text: string;
@@ -8,6 +10,9 @@ interface Props {
   /** Compact view: in the conversation and the message queue an image must not take up half the
    * window. */
   compact?: boolean;
+  /** Plain text instead of markdown. The click-to-edit view needs it: a click is mapped to a
+   * place in the source text, which only works while the shown text is the source. */
+  plain?: boolean;
 }
 
 /**
@@ -16,28 +21,21 @@ interface Props {
  * Without this component the card would show a raw `![](orc-image:7)`, something the owner did not
  * write and which says nothing.
  */
-export function DescriptionView({ text, className, compact = false }: Props) {
+export function DescriptionView({ text, className, compact = false, plain = false }: Props) {
   const { t } = useTranslation();
-  // Newlines around the marker are a trace of the editor setting it off from the text. On screen
-  // the image itself provides the spacing, and a blank line on top turns into a hole. We cut only
-  // those: inside the text we do not touch the owner's formatting.
-  const segments = parseDescription(text)
-    .map((s, i, all) => {
-      if (s.kind !== "text") return s;
-      let segmentText = s.text;
-      if (all[i - 1]?.kind === "image") segmentText = segmentText.replace(/^\n{1,2}/, "");
-      if (all[i + 1]?.kind === "image") segmentText = segmentText.replace(/\n{1,2}$/, "");
-      return { ...s, text: segmentText };
-    })
-    .filter((s) => s.kind !== "text" || s.text !== "");
+  const segments = displaySegments(text);
   if (segments.length === 0) return null;
   return (
     <div className={cn("text-[13px] leading-relaxed", className)}>
       {segments.map((s, i) =>
         s.kind === "text" ? (
-          <span key={i} className="whitespace-pre-wrap">
-            {s.text}
-          </span>
+          plain ? (
+            <span key={i} className="whitespace-pre-wrap">
+              <Linkified text={s.text} />
+            </span>
+          ) : (
+            <Markdown key={i} text={s.text} />
+          )
         ) : (
           <figure key={i} className="my-1.5">
             {/* A link, not just an image: a small screenshot in the card is unreadable, and

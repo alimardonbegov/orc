@@ -49,6 +49,10 @@ export interface UiState {
   dashSplit: AnalyticsSplit;
   /** Breakdown table attribute: model, project, effort or access mode. */
   dashBreakdown: BreakdownDim;
+  /** The chat window floating over the app is open. */
+  chatOpen: boolean;
+  /** The chat window is stretched wide, with the list of chats beside the conversation. */
+  chatExpanded: boolean;
 }
 
 export const DEFAULT_UI: UiState = {
@@ -66,6 +70,8 @@ export const DEFAULT_UI: UiState = {
   dashMetric: DEFAULT_METRIC,
   dashSplit: DEFAULT_SPLIT,
   dashBreakdown: DEFAULT_BREAKDOWN,
+  chatOpen: false,
+  chatExpanded: false,
 };
 
 // Version in the key: if the set of fields changes incompatibly, the old value is simply not picked up.
@@ -139,6 +145,8 @@ function sanitize(raw: Partial<UiState>): UiState {
     // The "by status" breakdown from the previous version of the screen is replaced with the default, like any garbage
     dashSplit: SPLITS.includes(raw.dashSplit as AnalyticsSplit) ? (raw.dashSplit as AnalyticsSplit) : DEFAULT_SPLIT,
     dashBreakdown: isBreakdownDim(raw.dashBreakdown) ? raw.dashBreakdown : DEFAULT_BREAKDOWN,
+    chatOpen: raw.chatOpen === true,
+    chatExpanded: raw.chatExpanded === true,
   };
 }
 

@@ -40,13 +40,15 @@ def test_start_ready_creates_worktree_and_session(repo, dispatcher, fake_cli, pr
     assert t.job_id == "job00001" and t.session_id == "sess-job00001"
     call = fake_cli.calls[0]
     assert call[0] == "start_bg" and call[3] == f"orc#{t.id} Do X"
-    assert "Do X" in call[2] and ".orchestrator/report.json" in call[2]
+    assert "Do X" in call[2] and "report.json" not in call[2]
     assert (git_repo / ".git" / "info" / "exclude").read_text().count(".orchestrator/") == 1
 
 
-def test_start_uses_task_overrides_and_project_defaults(repo, dispatcher, fake_cli, project):
+def test_start_uses_the_agent_then_the_project_and_ignores_a_value_in_the_card(repo, dispatcher, fake_cli, project):
     repo.update_project(project.id, default_model="sonnet", default_effort="medium")
-    t = repo.add_task(project.id, "A", status="todo", model="opus", permission_mode="bypassPermissions")
+    agent = repo.add_agent("Senior", model="opus", permission_mode="bypassPermissions")
+    # model and permission_mode in the row are leftovers of an older version: they must change nothing
+    repo.add_task(project.id, "A", status="todo", agent_id=agent.id, model="haiku", permission_mode="plan")
     dispatcher.tick()
     call = fake_cli.calls[0]
     assert call[4] == "opus" and call[5] == "medium" and call[6] == "bypassPermissions"
@@ -98,6 +100,7 @@ def test_failed_non_quota_resumes_once_then_fails(repo, dispatcher, fake_cli, pr
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED and "TypeError again" in t.blocker_detail
+    assert t.detail_code == "session_lost"
 
 
 def test_resume_picks_up_session_id_of_new_job(repo, dispatcher, fake_cli, project):
@@ -278,6 +281,7 @@ def test_lost_state_json_fails_task_after_threshold(repo, dispatcher, fake_cli, 
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED
     assert "state.json" in t.blocker_detail
+    assert t.detail_code == "session_lost"
     assert any(e["level"] == "warn" and "lost" in e["message"] for e in repo.list_events())
 
 
@@ -398,6 +402,7 @@ def test_start_failure_removes_orphan_worktree_and_retry_works(repo, dispatcher,
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED and "failed to start" in t.blocker_detail
+    assert t.detail_code is None  # a start failure has no code: the text stands alone
     assert not (git_repo / ".claude" / "worktrees" / f"orc-task-{t.id}").exists()
     assert f"orc/task-{t.id}" not in git_ops.list_branches(git_repo)
     dispatcher.retry(t.id)
@@ -457,6 +462,7 @@ def test_quota_retries_are_capped_and_task_fails(repo, dispatcher, fake_cli, pro
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED
     assert "quota_patterns" in t.blocker_detail
+    assert t.detail_code == "quota_limit"
     assert t.quota_retry_count >= QUOTA_RETRY_LIMIT
     assert any(e["level"] == "warn" and "quota limit" in e["message"] for e in repo.list_events())
 
@@ -553,7 +559,9 @@ def test_rework_returns_done_task_to_todo_and_resumes_session(repo, dispatcher, 
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.IN_PROGRESS and t.resume_with is None
-    assert fake_cli.calls[-1][0] == "resume_bg" and fake_cli.calls[-1][3] == "add one more test"
+    assert fake_cli.calls[-1][0] == "resume_bg" and fake_cli.calls[-1][3].startswith("add one more test\n\n")
+    # A card handed in once must be handed in again: a cheap model otherwise just ends its turn
+    assert "hand it in again" in fake_cli.calls[-1][3]
 
 
 def test_rework_archives_previous_report_as_comment(repo, dispatcher, fake_cli, project):
@@ -583,6 +591,68 @@ def test_rework_refuses_when_copy_or_session_is_gone(repo, dispatcher, fake_cli,
     with pytest.raises(ValueError, match="working copy"):
         dispatcher.rework(t.id, "rework it")
     assert repo.get_task(t.id).status == TaskStatus.DONE  # the card stayed done
+
+
+def _finish_and_drop_copy(repo, dispatcher, project, git_repo, *, merged: bool):
+    """A done card whose working copy was removed by the cleanup after the merge. Returns the card and the copy path."""
+    t = repo.add_task(project.id, "A", status="todo")
+    dispatcher.tick()
+    t = repo.get_task(t.id)
+    worktree = Path(t.worktree_path)
+    if not merged:  # the branch has a commit of its own that the target does not have
+        (worktree / "own.txt").write_text("x\n")
+        git_ops.git(["add", "own.txt"], worktree)
+        git_ops.git(["commit", "-m", "own work"], worktree)
+    repo.update_task(t.id, status=TaskStatus.DONE, done_at="2026-09-21T00:00:00")
+    git_ops.remove_worktree(git_repo, worktree)
+    if merged:
+        git_ops.delete_branch(git_repo, t.branch)
+    return repo.get_task(t.id), worktree
+
+
+def test_rework_restores_a_merged_copy_and_resumes_the_session(repo, dispatcher, fake_cli, project, git_repo):
+    # The merge removes the copy and the branch, but the card keeps the session: a rework makes the copy again
+    # at the same path (Claude Code finds a session by its folder) and continues the session there.
+    t, worktree = _finish_and_drop_copy(repo, dispatcher, project, git_repo, merged=True)
+    assert not worktree.exists()
+
+    fake_cli.stop_marks_stopped = True
+    dispatcher.rework(t.id, "carry on")
+
+    t = repo.get_task(t.id)
+    assert worktree.is_dir() and git_ops.current_branch(worktree) == t.branch
+    assert t.status == TaskStatus.TODO and t.resume_with == "carry on"
+    dispatcher.tick()
+    t = repo.get_task(t.id)
+    assert t.status == TaskStatus.IN_PROGRESS
+    assert fake_cli.calls[-1][0] == "resume_bg" and Path(fake_cli.calls[-1][1]) == worktree
+
+
+def test_rework_restores_the_copy_from_the_tip_of_the_target(repo, dispatcher, fake_cli, project, git_repo):
+    t, worktree = _finish_and_drop_copy(repo, dispatcher, project, git_repo, merged=True)
+    (git_repo / "later.txt").write_text("2\n")  # the target moved on after the merge
+    git_ops.git(["add", "later.txt"], git_repo)
+    git_ops.git(["commit", "-m", "later"], git_repo)
+
+    dispatcher.rework(t.id, "carry on")
+
+    assert (worktree / "later.txt").exists()
+
+
+def test_rework_restores_the_copy_on_a_branch_that_was_not_merged(repo, dispatcher, fake_cli, project, git_repo):
+    t, worktree = _finish_and_drop_copy(repo, dispatcher, project, git_repo, merged=False)
+
+    dispatcher.rework(t.id, "carry on")
+
+    assert (worktree / "own.txt").exists()  # the branch's own commit was not thrown away
+
+
+def test_rework_names_a_missing_target_branch_when_the_copy_cannot_be_restored(repo, dispatcher, project, git_repo):
+    t, _ = _finish_and_drop_copy(repo, dispatcher, project, git_repo, merged=True)
+    repo.update_task(t.id, target_branch="gone-branch")
+    with pytest.raises(ValueError, match="gone-branch"):
+        dispatcher.rework(t.id, "carry on")
+    assert repo.get_task(t.id).status == TaskStatus.DONE
 
 
 def test_rework_refuses_task_that_is_not_done(repo, dispatcher, project):

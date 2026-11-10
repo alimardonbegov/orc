@@ -7,7 +7,7 @@ import type { Project, Task, TaskStatus } from "../types";
 
 const task = (id: number, title: string, status: TaskStatus = "todo", projectId = 1, createdAt = ""): Task => ({
   id, project_id: projectId, title, description: "", status, priority: "normal", blocker: null, blocker_detail: null,
-  target_branch: "main", model: null, effort: null, permission_mode: null, verify_cmd: null, requires_review: 0,
+  target_branch: "main", verify_cmd: null, requires_review: 0,
   worktree_path: null, branch: null, job_id: null, session_id: null, auto_resume_count: 0, state_miss_count: 0,
   quota_retry_count: 0, conflict_retry_count: 0, resume_with: null, outbox_state: null, merge_queued_at: null, retry_after: null, report_json: null,
   created_at: createdAt, updated_at: "", done_at: null, archived_at: null, position: null, usage_json: null, depends_on: [],

@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from orc import git_ops
+from tests.fakes import to_work
 
 
 def _project(client, git_repo):
@@ -11,7 +12,7 @@ def _project(client, git_repo):
 def _started(client, repo, title="A"):
     """A task brought to in_progress by a tick: with a session, worktree and branch."""
     t = client.post("/api/tasks", json={"project_id": 1, "title": title, "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     return repo.get_task(t["id"])
 
@@ -61,7 +62,7 @@ def test_archive_rejected_while_task_is_working(client, repo, git_repo):
 def test_archived_task_is_invisible_to_dispatcher(client, repo, fake_cli, git_repo):
     _project(client, git_repo)
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post(f"/api/tasks/{t['id']}/archive")
     client.post("/api/dispatcher/tick")
     assert fake_cli.calls == []  # the task is in todo but archived: it is not taken into work
@@ -77,7 +78,7 @@ def test_archived_blocker_stops_blocking(client, repo, git_repo):
     _project(client, git_repo)
     a = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
     b = client.post("/api/tasks", json={"project_id": 1, "title": "B", "description": "what to do", "depends_on": [a["id"]]}).json()
-    client.patch(f"/api/tasks/{b['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{b['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     assert repo.get_task(b["id"]).status == "todo"  # waits for A
 

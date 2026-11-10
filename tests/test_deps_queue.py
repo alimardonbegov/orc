@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 from orc.models import TaskStatus
+from tests.fakes import to_work
 
 
 def _unlimited(repo, project):
@@ -133,7 +134,7 @@ def test_api_created_task_waits_until_blocker_is_done(client, git_repo):
     assert task["depends_on"] == [blocker["id"]]
 
     for t in (blocker, task):
-        assert client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"}).status_code == 200
+        assert client.patch(f"/api/tasks/{t['id']}", json=to_work(client)).status_code == 200
     assert client.post("/api/dispatcher/tick").status_code == 200
 
     assert client.get(f"/api/tasks/{blocker['id']}").json()["status"] == "in_progress"
@@ -145,7 +146,7 @@ def test_api_deps_added_to_todo_task_take_effect(client, git_repo):
     client.post("/api/projects", json={"name": "p", "path": str(git_repo), "max_workers": 10})
     blocker = client.post("/api/tasks", json={"project_id": 1, "title": "Blocker", "description": "what to do"}).json()
     task = client.post("/api/tasks", json={"project_id": 1, "title": "Dependent", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{task['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{task['id']}", json=to_work(client))
     client.patch(f"/api/tasks/{task['id']}", json={"depends_on": [blocker["id"]]})
 
     client.post("/api/dispatcher/tick")

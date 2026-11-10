@@ -1,10 +1,14 @@
 import { forwardRef } from "react";
 import { Archive, CheckCheck, FolderGit2, GitBranch, Plus, Search, Settings2, X, type LucideIcon } from "lucide-react";
 import { Horn } from "../brand/glyphs";
-import type { Project } from "../types";
+import type { Agent, Project } from "../types";
+import { AgentAvatar } from "./AgentAvatar";
 import type { View } from "../hooks/useUiState";
 import { Button, IconButton } from "../ui/Button";
 import { Segmented } from "../ui/Segmented";
+import { WorkingAgentsChip } from "./WorkingAgentsChip";
+import type { WorkingAgent } from "../workingAgents";
+import { LabelFilter } from "./LabelFilter";
 import { fieldBase, focusRing } from "../ui/tokens";
 import { Tip } from "../ui/Overlays";
 import { cn } from "../lib/cn";
@@ -26,6 +30,11 @@ interface Props {
   showArchived: boolean;
   onShowArchived: (value: boolean) => void;
   archivedCount: number;
+  /** Narrow the board to one label (null means all). */
+  labelFilter?: number | null;
+  onLabelFilter?: (value: number | null) => void;
+  /** The saved views menu, drawn after the label filter (ViewsMenu). Null on an older server without views. */
+  viewsSlot?: React.ReactNode;
   /** How many finished results of the project the owner has not seen yet (viewing.ts). 0 — no counter. */
   unviewedCount?: number;
   onProjectSettings: () => void;
@@ -35,8 +44,13 @@ interface Props {
   onCreateTask: () => void;
   /** Whether tasks can be created at all: not for a project with a missing folder or an archived one. */
   canCreateTask?: boolean;
-  /** A thin thread runs above the board while agents are actually working. */
-  live: boolean;
+  /** Agents busy right now (cards and chats): the chip with the list sits by the view switch. */
+  working: readonly WorkingAgent[];
+  onOpenTask: (id: number) => void;
+  onOpenChat: (id: number) => void;
+  /** The project's lead and the way to talk to them. */
+  lead?: Agent | null;
+  onOpenLeadChat?: () => void;
 }
 
 /** Filter toggle button: the pressed state is shown by border and color, not left to guesswork. */
@@ -109,19 +123,26 @@ export const TopBar = forwardRef<HTMLInputElement, Props>(function TopBar(
     showArchived,
     onShowArchived,
     archivedCount,
+    labelFilter = null,
+    onLabelFilter,
+    viewsSlot,
     unviewedCount = 0,
     onProjectSettings,
     onOpenBranches,
     onOpenWorktrees,
     onCreateTask,
     canCreateTask = true,
-    live,
+    working,
+    onOpenTask,
+    onOpenChat,
+    lead,
+    onOpenLeadChat,
   },
   searchRef,
 ) {
   const { t } = useTranslation();
   return (
-    <header className="relative flex h-12 shrink-0 items-center gap-2 border-b border-[var(--line)] bg-[var(--surface)] px-3">
+    <header className="flex h-12 shrink-0 items-center gap-2 border-b border-[var(--line)] bg-[var(--surface)] px-3">
       {project ? (
         <div className="flex min-w-0 shrink items-center gap-2">
           <h1 className="min-w-0 truncate text-[14px] font-semibold tracking-tight text-[var(--ink)]">{project.name}</h1>
@@ -150,6 +171,18 @@ export const TopBar = forwardRef<HTMLInputElement, Props>(function TopBar(
           <Tip text={t("topBar.worktreesTip")}>
             <IconButton icon={FolderGit2} label={t("topBar.worktreesTip")} size="sm" onClick={onOpenWorktrees} />
           </Tip>
+          {lead && (
+            <Tip text={t("agents.lead.chatTip", { name: lead.name })}>
+              <button
+                type="button"
+                aria-label={t("agents.lead.chatTip", { name: lead.name })}
+                className={cn("flex h-7 w-7 items-center justify-center rounded-[var(--radius-sm)] hover:bg-[color-mix(in_oklab,var(--ink)_8%,transparent)]", focusRing)}
+                onClick={onOpenLeadChat}
+              >
+                <AgentAvatar agent={lead} size={20} title="" />
+              </button>
+            </Tip>
+          )}
           <Tip text={t("topBar.settingsTip")}>
             <IconButton icon={Settings2} label={t("topBar.settingsTip")} size="sm" onClick={onProjectSettings} />
           </Tip>
@@ -190,6 +223,9 @@ export const TopBar = forwardRef<HTMLInputElement, Props>(function TopBar(
             )}
           </div>
 
+          {onLabelFilter && <LabelFilter value={labelFilter} onChange={onLabelFilter} />}
+          {viewsSlot}
+
           <FilterToggle
             active={attentionOnly}
             onClick={() => onAttentionOnly(!attentionOnly)}
@@ -227,6 +263,7 @@ export const TopBar = forwardRef<HTMLInputElement, Props>(function TopBar(
       )}
 
       <div className="ml-auto flex shrink-0 items-center gap-2">
+        <WorkingAgentsChip working={working} onOpenTask={onOpenTask} onOpenChat={onOpenChat} />
         {/* The view can always be switched, even when there is no project: the summary across all projects
             makes sense on an empty board too. */}
         <Segmented
@@ -261,14 +298,6 @@ export const TopBar = forwardRef<HTMLInputElement, Props>(function TopBar(
         )}
       </div>
 
-      {/* The thread under the header: while at least one agent is working, a phosphor segment runs along it.
-          It is the only animation that plays on its own, and it means
-          exactly one thing — something is happening right now. */}
-      {live && (
-        <span aria-hidden className="pointer-events-none absolute inset-x-0 -bottom-px h-px overflow-hidden">
-          <span className="orc-trace block h-px w-1/4 bg-gradient-to-r from-transparent via-[var(--live)] to-transparent" />
-        </span>
-      )}
     </header>
   );
 });

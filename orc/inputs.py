@@ -18,16 +18,29 @@ HOOK_SCRIPT = Path(__file__).parent / "hooks" / "input_hook.py"
 # The ceiling is only needed so the session does not hang forever if orc died together with the database.
 HOOK_TIMEOUT_SEC = 24 * 3600
 
-# The task secret for its hooks. A file, not an argument: the hook command line sits in the
-# session's `--settings` (argv of the claude process, saved session options) and is visible through ps
-# to anyone, while a file with 0600 permissions in the task working copy is visible only to the owner.
-HOOK_SECRET_REL_PATH = ".orchestrator/hook-secret"
+# The task secret for its hooks and for `orc task done`. A file, not an argument: the hook command line sits in
+# the session's `--settings` (argv of the claude process, saved session options) and is visible through ps
+# to anyone, while a file with 0600 permissions is visible only to the owner. It lives in orc's data directory,
+# not in the working copy: a working copy can be deleted and made again under a live session (a cleanup script,
+# `git clean -x`, the agent itself), and the secret must outlive that, or the session can never hand in.
+HOOK_SECRETS_DIR = "hook-secrets"
+# Where sessions issued before the data directory kept it. Read only as a fallback, for those sessions.
+LEGACY_HOOK_SECRET_REL_PATH = ".orchestrator/hook-secret"
 
 
-def write_hook_secret(worktree: Path, secret: str) -> Path:
-    """Write the secret into the task working copy with 0600 permissions. Returns the file path."""
-    path = Path(worktree) / HOOK_SECRET_REL_PATH
+def hook_secret_path(data_dir: Path, task_id: int) -> Path:
+    return Path(data_dir) / HOOK_SECRETS_DIR / f"task-{task_id}"
+
+
+def chat_hook_secret_path(data_dir: Path, chat_id: int) -> Path:
+    return Path(data_dir) / HOOK_SECRETS_DIR / f"chat-{chat_id}"
+
+
+def write_hook_secret(path: Path, secret: str) -> Path:
+    """Write the secret with 0600 permissions, in a folder only the owner can open. Returns the file path."""
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(secret)
@@ -128,13 +141,14 @@ def kind_from_needs(needs: str | None) -> str | None:
     return None
 
 
-def hook_settings(api_base: str, task_id: int, secret_path: str | None = None,
-                  python: str | None = None) -> dict:
+def hook_settings(api_base: str, task_id: int | None = None, secret_path: str | None = None,
+                  python: str | None = None, chat_id: int | None = None) -> dict:
     """`hooks` entries for `claude --settings`: PermissionRequest for everything and PreToolUse for
     interactive tools. The API address, task number and secret path go as arguments of the
     command: the hook knows nothing about the orc database and must not guess it. This is the only place
     where the hook command line is assembled."""
-    command = f"{python or sys.executable} {HOOK_SCRIPT} --api {api_base} --task {task_id}"
+    owner = f"--chat {chat_id}" if chat_id is not None else f"--task {task_id}"
+    command = f"{python or sys.executable} {HOOK_SCRIPT} --api {api_base} {owner}"
     if secret_path:
         command += f" --secret-file {shlex.quote(secret_path)}"
     hook = {"type": "command", "command": command, "timeout": HOOK_TIMEOUT_SEC}

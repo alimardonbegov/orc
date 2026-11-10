@@ -17,6 +17,9 @@ PID_REL_PATH = ".orchestrator/verify.pid"
 class VerifyResult:
     ok: bool
     output: str
+    # The process exit code; None when there is none (a timeout kill, a launch failure)
+    exit_code: int | None = None
+    timed_out: bool = False
 
 
 def _pid_path(cwd: Path) -> Path:
@@ -76,7 +79,9 @@ def run_verify(cmd: str, cwd: Path, timeout_sec: int) -> VerifyResult:
             text=True,
             start_new_session=True,
         )
-        pgid = os.getpgid(proc.pid)
+        # start_new_session makes the child the leader of its own group, so the group id is its pid. Asking
+        # os.getpgid instead raced with a command that exits at once (`true`): ESRCH failed a passing check.
+        pgid = proc.pid
         pid_file.parent.mkdir(parents=True, exist_ok=True)
         pid_file.write_text(str(pgid))
         try:
@@ -93,7 +98,7 @@ def run_verify(cmd: str, cwd: Path, timeout_sec: int) -> VerifyResult:
             output = (stdout or "") + (stderr or "")
             if isinstance(output, bytes):
                 output = output.decode(errors="replace")
-            return VerifyResult(False, f"timeout {timeout_sec}s\n{output}")
-        return VerifyResult(proc.returncode == 0, stdout + stderr)
+            return VerifyResult(False, f"timeout {timeout_sec}s\n{output}", None, True)
+        return VerifyResult(proc.returncode == 0, stdout + stderr, proc.returncode)
     finally:
         _clear_pid_file(pid_file, pgid)

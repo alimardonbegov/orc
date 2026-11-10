@@ -24,6 +24,15 @@ class FakeClaudeCli:
         self.transcript_for_new: str | None = None
         # Daemon sessions that are not in the orc journal (started by the owner by hand)
         self.foreign_sessions: list[dict] = []
+        # What --append-system-prompt each launch got, in launch order: ("start_bg" | "resume_bg", job, text)
+        self.system_prompts: list[tuple] = []
+        # What flags each resume got, in launch order: {"settings", "name", "model", "effort", "permission_mode"}
+        self.resume_options: list[dict] = []
+        # None: `claude attach` cannot reach sessions, as in a build with no pseudo-terminal.
+        # Otherwise called with (job_id, text, interrupt) to play the session receiving what was typed.
+        self.on_typed = None
+        self.typed: list[tuple] = []
+        self.interrupted: list[str] = []
         # True: `claude agents --json` is unavailable
         self.sessions_error = False
         self._counter = 0
@@ -42,22 +51,39 @@ class FakeClaudeCli:
         return f"job{self._counter:05d}"
 
     def start_bg(self, cwd, prompt, name, model=None, effort=None, permission_mode="auto",
-                 settings=None) -> str:
+                 settings=None, append_system_prompt=None) -> str:
         job = self._new_id()
+        self.system_prompts.append(("start_bg", job, append_system_prompt))
         self.calls.append(("start_bg", str(cwd), prompt, name, model, effort, permission_mode, settings))
         if not self.delay_state:
             self.states.setdefault(job, JobState("working", "", None, f"sess-{job}", None, self.transcript_for_new))
         return job
 
-    def resume_bg(self, cwd, session_id, prompt, settings=None) -> str:
+    def resume_bg(self, cwd, session_id, prompt, settings=None, append_system_prompt=None, name=None, model=None,
+                  effort=None, permission_mode=None) -> str:
         # Same contract as the real ClaudeCli.resume_bg: without a session_id there is nothing to resume
         if not session_id:
             raise ClaudeCliError("resume without session_id: nothing to resume")
         job = self._new_id()
+        self.system_prompts.append(("resume_bg", job, append_system_prompt))
         self.calls.append(("resume_bg", str(cwd), session_id, prompt, settings))
+        self.resume_options.append({"settings": settings, "name": name, "model": model, "effort": effort,
+                                    "permission_mode": permission_mode})
         if not self.delay_state:
             self.states.setdefault(job, JobState("working", "", None, session_id, None, self.transcript_for_new))
         return job
+
+    def send_input(self, job_id, text, interrupt, confirm) -> bool:
+        if self.on_typed is None:
+            raise ClaudeCliError("claude attach is unavailable")
+        self.typed.append((job_id, text, interrupt))
+        self.on_typed(job_id, text, interrupt)
+        return confirm()
+
+    def send_interrupt(self, job_id) -> None:
+        if self.on_typed is None:
+            raise ClaudeCliError("claude attach is unavailable")
+        self.interrupted.append(job_id)
 
     def stop(self, job_id) -> None:
         self.calls.append(("stop", job_id))
@@ -78,15 +104,28 @@ class FakeClaudeCli:
     # Test helper: move a job to a state.
     # session_id=None is set explicitly (the session never became known), a string is a changed session.
     def set_state(self, job_id, state, detail="", needs=None, session_id=KEEP, transcript_path=KEEP, tempo=None,
-                  in_flight=0, queued=0, timers=0):
+                  in_flight=0, queued=0, timers=0, fan=()):
         old = self.states.get(job_id)
         if session_id is KEEP:
             session_id = old.session_id if old else f"sess-{job_id}"
         if transcript_path is KEEP:
             transcript_path = old.transcript_path if old else None
         self.states[job_id] = JobState(state, detail, needs, session_id, None, transcript_path, tempo, in_flight,
-                                       queued, timers)
+                                       queued, timers, fan)
 
     def drop_state(self, job_id) -> None:
         """The state.json file is gone: `claude rm` or cleanup of old jobs."""
         self.states.pop(job_id, None)
+
+
+def to_work(client) -> dict:
+    """A PATCH body that sends a card to the queue, assigned: without an agent the API refuses it."""
+    return {"status": "todo", "agent_id": any_agent(client)}
+
+
+def any_agent(client) -> int:
+    """The id of a shared agent, created on first use."""
+    agents = client.get("/api/agents").json()
+    if agents:
+        return agents[0]["id"]
+    return client.post("/api/agents", json={"name": "Test agent"}).json()["id"]

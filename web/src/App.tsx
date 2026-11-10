@@ -1,10 +1,10 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PlugZap } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { api } from "./api";
 import { usePolling } from "./hooks/usePolling";
 import { useUiState } from "./hooks/useUiState";
-import { needsAttention } from "./status";
+import { needsAttention, workIssues } from "./status";
 import { isUnviewed, tracksViewed } from "./viewing";
 import { Board, getColumns } from "./components/Board";
 import { Dashboard } from "./components/Dashboard";
@@ -13,13 +13,17 @@ import { AttentionBar } from "./components/AttentionBar";
 import { ProjectAlert } from "./components/ProjectAlert";
 import { BranchesDialog } from "./components/BranchesDialog";
 import { WorktreesDialog } from "./components/WorktreesDialog";
-import { EmptyDescriptionDialog } from "./components/EmptyDescriptionDialog";
+import { NotReadyDialog } from "./components/NotReadyDialog";
 import { ProjectDialog } from "./components/ProjectDialog";
 import { SettingsDialog } from "./components/SettingsDialog";
 import { Sidebar } from "./components/Sidebar";
-import { TaskForm } from "./components/TaskForm";
+import { NewTaskForm } from "./components/NewTaskForm";
 import { TaskModal } from "./components/TaskModal";
+import { workingAgents } from "./workingAgents";
 import { TopBar } from "./components/TopBar";
+import { BatchToolbar, BulkResultDialog } from "./components/BatchToolbar";
+import { ViewsMenu } from "./components/ViewsMenu";
+import { useBoardViews } from "./hooks/useBoardViews";
 import { HelpPages, type HelpPage } from "./components/help/HelpPages";
 import { Modal } from "./ui/Modal";
 import { Confirm } from "./ui/Confirm";
@@ -29,7 +33,15 @@ import { statusLabel } from "./labels";
 import { useTranslation } from "./i18n";
 import { parseHiddenModels } from "./models";
 import { AppHiddenModelsContext } from "./hiddenModels";
-import type { Task, TaskStatus } from "./types";
+import { AgentsContext, ManageAgentsContext, chatProjectOf } from "./agents";
+import { subtaskProgress } from "./relations";
+import { SubtaskProgressContext } from "./subtaskProgress";
+import { AppCardSettingsContext, parseCardSettings } from "./cardSettings";
+import { AgentsPage } from "./components/AgentsPage";
+import { ChatOverlay } from "./components/ChatOverlay";
+import type { WorkspacePage } from "./components/Sidebar";
+import type { Agent } from "./types";
+import type { BoardFilters, BulkBody, BulkResult, Task, TaskStatus } from "./types";
 
 export default function App() {
   const { t } = useTranslation();
@@ -37,7 +49,14 @@ export default function App() {
   // Search lives only in the current session: a filter restored after a restart would look like
   // "half of the tasks vanished".
   const [search, setSearch] = useState("");
-  const [creating, setCreating] = useState(false);
+  // Like the search, the label filter lives for the session only: a label that was deleted meanwhile must not leave an empty board
+  const [labelFilter, setLabelFilter] = useState<number | null>(null);
+  // Cards selected for a bulk action. Not remembered: it follows what the board shows (Board's selection.onVisible).
+  const [selected, setSelected] = useState<ReadonlySet<number>>(new Set());
+  const [bulkPending, setBulkPending] = useState(false);
+  const [bulkResult, setBulkResult] = useState<BulkResult | null>(null);
+  // true: a new card of the current project; a task: a subtask of that card, in its project
+  const [creating, setCreating] = useState<boolean | Task>(false);
   const [createPending, setCreatePending] = useState(false);
   const [dispatcherPending, setDispatcherPending] = useState(false);
   const [usagePending, setUsagePending] = useState(false);
@@ -55,12 +74,13 @@ export default function App() {
   // it in the dialog. null means the dialog is closed.
   const [forceMove, setForceMove] = useState<{ task: Task; to: TaskStatus } | null>(null);
   const [forcePending, setForcePending] = useState(false);
-  // A card without a task description is not sent to work: instead of the move we show a dialog
-  // with an explanation. null means the dialog is closed.
-  const [emptyDesc, setEmptyDesc] = useState<Task | null>(null);
-  // A card opened for repair from this dialog must open straight in the editor: after a rejection
-  // the person needs a text field, not one more click on the pencil.
-  const [openInEditor, setOpenInEditor] = useState(false);
+  // A card with nobody assigned or no task description is not sent to work: instead of the move we
+  // show a dialog with an explanation. null means the dialog is closed.
+  const [notReady, setNotReady] = useState<Task | null>(null);
+  // A card opened for repair from this dialog opens with that field ready: after a rejection the
+  // person needs the field, not a search for it.
+  // A card opened from "Waiting for me" opens at the end of its thread, where the question is.
+  const [openFocus, setOpenFocus] = useState<"description" | "agent" | "thread" | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   // archived=all: archived projects arrive with the same poll and are split out on the client; a
@@ -79,6 +99,21 @@ export default function App() {
   // re-read after saving, so a rare poll is enough: it picks up edits from another tab.
   const settings = usePolling(() => api.settings(), 60000);
   const appHiddenModels = useMemo(() => parseHiddenModels(settings.data?.hidden_models), [settings.data]);
+  const appCardSettings = useMemo(() => parseCardSettings(settings.data?.card_settings), [settings.data]);
+
+  const agents = usePolling(() => api.agents(), 15000);
+  const chats = usePolling(() => api.chats(), 5000);
+  const agentList = useMemo(() => agents.data ?? [], [agents.data]);
+  const chatList = useMemo(() => chats.data ?? [], [chats.data]);
+  const [workspacePage, setWorkspacePage] = useState<WorkspacePage | null>(null);
+  // No agent to assign a card to: the way to make one, from wherever that became clear.
+  const manageAgents = useCallback(() => {
+    setCreating(false);
+    setUi({ openTaskId: null });
+    setHelpPage(null);
+    setWorkspacePage("agents");
+  }, [setUi]);
+  const [chatId, setChatId] = useState<number | null>(null);
 
   const list = useMemo(() => projects.data ?? [], [projects.data]);
   // Working projects are those not archived: the default project comes from them, and they decide
@@ -88,6 +123,7 @@ export default function App() {
   // Everything except the board in the archived view counts only live tasks: a removed card does
   // not wait for a human, does not occupy a worker and is not valid as a blocker for a new task.
   const liveTasks = useMemo(() => allTasks.filter((t) => !t.archived_at), [allTasks]);
+  const progressByParent = useMemo(() => subtaskProgress(liveTasks), [liveTasks]);
 
   // The selected project is restored from the saved state. The first one in the list is only a
   // fallback: for the very first launch and for the case when the saved project was deleted.
@@ -160,7 +196,22 @@ export default function App() {
     () => (viewingOn ? liveTasks.filter((t) => t.project_id === currentId && isUnviewed(t)).length : 0),
     [viewingOn, liveTasks, currentId],
   );
+  const boardViews = useBoardViews(currentId);
+  const boardFilters: BoardFilters = {
+    search: search.trim(),
+    attention_only: ui.attentionOnly,
+    label_id: labelFilter,
+    show_done: ui.showDone,
+    show_archived: ui.showArchived,
+    done_sort: ui.doneSort,
+  };
+  const applyFilters = (f: BoardFilters) => {
+    setSearch(f.search);
+    setLabelFilter(f.label_id);
+    setUi({ attentionOnly: f.attention_only, showDone: f.show_done, showArchived: f.show_archived, doneSort: f.done_sort });
+  };
   const live = (dispatcher.data?.running ?? 0) > 0 && !(dispatcher.data?.paused ?? false);
+  const working = useMemo(() => workingAgents(agentList, liveTasks, chatList), [agentList, liveTasks, chatList]);
 
   // Shared action handler: success clears earlier complaints, failure shows a toast and keeps the
   // promise from flying away unhandled.
@@ -170,6 +221,41 @@ export default function App() {
       .catch((e: unknown) => {
         toast.error(e instanceof Error ? e.message : String(e));
       });
+  };
+
+  const toggleSelected = useCallback((id: number) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  }, []);
+  // The board reports the cards it shows; whatever is selected beyond them is dropped
+  const pruneSelected = useCallback((visible: number[]) => {
+    setSelected((prev) => {
+      const shown = new Set(visible);
+      const next = new Set([...prev].filter((id) => shown.has(id)));
+      return next.size === prev.size ? prev : next;
+    });
+  }, []);
+  const clearSelected = useCallback(() => setSelected(new Set()), []);
+  const applyBulk = (change: Omit<BulkBody, "task_ids">) => {
+    setBulkPending(true);
+    api
+      .bulkTasks({ ...change, task_ids: [...selected] })
+      .then((result) => {
+        void tasks.refresh();
+        if (result.failed === 0) {
+          toast.success(t("bulk.done", { count: result.ok }));
+          setSelected(new Set());
+          return;
+        }
+        // Honest about a partial refusal: the refused cards stay selected and the dialog says why
+        setSelected(new Set(result.results.filter((r) => !r.ok).map((r) => r.id)));
+        setBulkResult(result);
+      })
+      .catch((e: unknown) => toast.error(t("bulk.error", { error: e instanceof Error ? e.message : String(e) })))
+      .finally(() => setBulkPending(false));
   };
 
   // Archiving a project right from the banner: the result is visible only after re-reading the
@@ -188,6 +274,33 @@ export default function App() {
   const openTask = (id: number) => {
     const task = allTasks.find((t) => t.id === id);
     setUi(task ? { openTaskId: id, projectId: task.project_id } : { openTaskId: id });
+    setOpenFocus(null);
+  };
+  /** The owner came to answer: the card opens at the end of the conversation, not on the task. */
+  const openToAnswer = (id: number) => {
+    openTask(id);
+    setOpenFocus("thread");
+  };
+
+  /** The agent's latest chat about this project, or a new one: "talk to the agent" should not pile up empty chats. */
+  const openChatWith = async (agent: Agent, projectId: number | null) => {
+    try {
+      const chat =
+        chatList.find((c) => c.agent_id === agent.id && c.project_id === projectId) ??
+        (await api.addChat({ agent_id: agent.id, project_id: projectId }));
+      setChatId(chat.id);
+      setUi({ chatOpen: true });
+      void chats.refresh();
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  /** A chat by id, from a routine run: the window opens on it. */
+  const openChat = (id: number) => {
+    setChatId(id);
+    setUi({ chatOpen: true });
+    void chats.refresh();
   };
 
   const refreshUsage = () => {
@@ -241,6 +354,10 @@ export default function App() {
         e.preventDefault();
         setHelpPage(null);
         setUi({ view: ui.view === "dashboard" ? "board" : "dashboard" });
+      } else if (e.key === "c" || e.key === "с") {
+        // Cyrillic "с" is the same physical key as c on the Russian layout
+        e.preventDefault();
+        setUi({ chatOpen: !ui.chatOpen });
       } else if (e.key === "?" || (e.shiftKey && e.code === "Slash")) {
         // On the Russian layout the same key with Shift gives a comma, not "?", so, as with the
         // letters above, we also catch the physical key.
@@ -250,12 +367,16 @@ export default function App() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [canCreateTask, ui.sidebarCollapsed, ui.view, setUi]);
+  }, [canCreateTask, ui.sidebarCollapsed, ui.view, ui.chatOpen, setUi]);
 
   const editedProject = projectDialog?.id != null ? list.find((p) => p.id === projectDialog.id) ?? null : null;
 
   return (
     <AppHiddenModelsContext.Provider value={appHiddenModels}>
+    <AppCardSettingsContext.Provider value={appCardSettings}>
+    <AgentsContext.Provider value={agentList}>
+    <ManageAgentsContext.Provider value={manageAgents}>
+    <SubtaskProgressContext.Provider value={progressByParent}>
       <div className="flex h-full overflow-hidden bg-[var(--canvas)]">
         <Sidebar
           projects={list}
@@ -274,12 +395,22 @@ export default function App() {
           onEventsOpen={setEventsOpen}
           onOpenTask={(id) => {
             setEventsOpen(false);
+            // A card opened from the column may be pressed on the Agents or Chats page: go back to
+            // the board of its project instead of opening the card over a page of another scope.
+            setHelpPage(null);
+            setWorkspacePage(null);
             openTask(id);
           }}
           awake={dispatcher.data !== null && !dispatcher.data.paused}
           working={live}
+          workspacePage={workspacePage}
+          onOpenWorkspacePage={(page) => {
+            setHelpPage(null);
+            setWorkspacePage(page);
+          }}
           onSelect={(id) => {
             setHelpPage(null);
+            setWorkspacePage(null);
             setUi({ projectId: id });
           }}
           onReorderProjects={(orderedIds) => {
@@ -298,7 +429,10 @@ export default function App() {
           onAddProject={() => setProjectDialog({ id: null })}
           onOpenSettings={() => setSettingsOpen(true)}
           helpPage={helpPage}
-          onOpenHelp={setHelpPage}
+          onOpenHelp={(page) => {
+            setWorkspacePage(null);
+            setHelpPage(page);
+          }}
         />
 
         <main className="flex min-w-0 flex-1 flex-col">
@@ -309,6 +443,30 @@ export default function App() {
               onClose={() => setHelpPage(null)}
               onAddProject={() => setProjectDialog({ id: null })}
             />
+          ) : workspacePage === "agents" ? (
+            <AgentsPage
+              projects={list}
+              onChanged={() => {
+                void agents.refresh();
+                void projects.refresh();
+                void chats.refresh();
+              }}
+              onChat={(agent) => void openChatWith(agent, chatProjectOf(agent, list))}
+              onOpenTask={openTask}
+            />
+          ) : workspacePage === "routines" ? (
+            // All routines, in a project or outside any: the runs of a project routine are cards on
+            // its board, the runs of a free one are chats.
+            <div className="min-h-0 flex-1 overflow-hidden px-5 py-4">
+              <RoutinesView
+                project={null}
+                projects={list}
+                canCreate
+                onOpenTask={openTask}
+                onOpenChat={openChat}
+                onTasksChanged={() => void tasks.refresh()}
+              />
+            </div>
           ) : (
             <>
               <TopBar
@@ -326,13 +484,33 @@ export default function App() {
                 showArchived={ui.showArchived}
                 onShowArchived={(v) => setUi({ showArchived: v })}
                 archivedCount={archivedCount}
+                labelFilter={labelFilter}
+                onLabelFilter={setLabelFilter}
+                viewsSlot={
+                  currentId !== null && boardViews.supported ? (
+                    <ViewsMenu
+                      projectId={currentId}
+                      views={boardViews.views}
+                      current={boardFilters}
+                      onApply={applyFilters}
+                      onChanged={() => void boardViews.reload()}
+                    />
+                  ) : null
+                }
                 unviewedCount={unviewedCount}
                 onProjectSettings={() => currentId !== null && setProjectDialog({ id: currentId })}
                 onOpenBranches={() => setBranchesOpen(true)}
                 onOpenWorktrees={() => setWorktreesOpen(true)}
                 canCreateTask={canCreateTask}
                 onCreateTask={() => setCreating(true)}
-                live={live}
+                working={working}
+                onOpenTask={openTask}
+                onOpenChat={openChat}
+                lead={agentList.find((a) => a.id === current?.lead_agent_id) ?? null}
+                onOpenLeadChat={() => {
+                  const lead = agentList.find((a) => a.id === current?.lead_agent_id);
+                  if (lead && current) void openChatWith(lead, current.id);
+                }}
               />
 
               {connectionError && (
@@ -356,7 +534,7 @@ export default function App() {
                 <AttentionBar
                   tasks={attention}
                   elsewhere={attentionElsewhere}
-                  onOpen={openTask}
+                  onOpen={openToAnswer}
                 />
               )}
 
@@ -392,8 +570,10 @@ export default function App() {
                   <RoutinesView
                     key={current.id}
                     project={current}
+                    projects={list}
                     canCreate={canCreateTask}
                     onOpenTask={openTask}
+                    onOpenChat={openChat}
                     onTasksChanged={() => void tasks.refresh()}
                   />
                 ) : projects.data === null && projects.error ? (
@@ -422,10 +602,12 @@ export default function App() {
                     tasks={allTasks}
                     search={search}
                     attentionOnly={ui.attentionOnly}
+                    labelId={labelFilter}
                     showDone={ui.showDone}
                     showArchived={ui.showArchived}
                     doneSort={ui.doneSort}
                     onDoneSortChange={(doneSort) => setUi({ doneSort })}
+                    selection={{ ids: selected, onToggle: toggleSelected, onVisible: pruneSelected }}
                     viewing={
                       viewingOn
                         ? {
@@ -464,54 +646,73 @@ export default function App() {
                         () => void tasks.refresh(),
                       );
                     }}
-                    onEmptyDescription={setEmptyDesc}
-                    onOpen={openTask}
+                    onNotReady={setNotReady}
+                    onOpen={ui.attentionOnly ? openToAnswer : openTask}
                     onCreate={() => setCreating(true)}
                   />
                 )}
               </section>
+              {ui.view === "board" && currentId !== null && (
+                <BatchToolbar
+                  tasks={allTasks.filter((x) => selected.has(x.id))}
+                  projectId={currentId}
+                  archivedView={ui.showArchived}
+                  pending={bulkPending}
+                  onApply={applyBulk}
+                  onClear={clearSelected}
+                />
+              )}
+              <BulkResultDialog result={bulkResult} tasks={allTasks} onClose={() => setBulkResult(null)} />
             </>
           )}
         </main>
 
         {ui.openTaskId !== null && (
           <TaskModal
-            key={`${ui.openTaskId}:${openInEditor}`}
+            key={`${ui.openTaskId}:${openFocus}`}
             taskId={ui.openTaskId}
             allTasks={liveTasks}
             projects={list}
-            initialEditing={openInEditor}
+            focusOn={openFocus}
             onOpenTask={openTask}
+            onCreateSubtask={(parent) => setCreating(parent)}
             onClose={() => {
               setUi({ openTaskId: null });
-              setOpenInEditor(false);
+              setOpenFocus(null);
             }}
             onChanged={tasks.refresh}
           />
         )}
 
-        {emptyDesc && (
-          <EmptyDescriptionDialog
+        {notReady && (
+          <NotReadyDialog
             open
-            taskId={emptyDesc.id}
-            taskTitle={emptyDesc.title}
-            onClose={() => setEmptyDesc(null)}
+            issues={workIssues(notReady)}
+            taskId={notReady.id}
+            taskTitle={notReady.title}
+            onClose={() => setNotReady(null)}
             onFix={() => {
-              setUi({ openTaskId: emptyDesc.id, projectId: emptyDesc.project_id });
-              setOpenInEditor(true);
-              setEmptyDesc(null);
+              setUi({ openTaskId: notReady.id, projectId: notReady.project_id });
+              setOpenFocus(workIssues(notReady).includes("assignee") ? "agent" : "description");
+              setNotReady(null);
             }}
           />
         )}
 
-        {creating && currentId !== null && (
-          <Modal open onOpenChange={(o) => !o && setCreating(false)} title={t("app.newTaskTitle")} size="lg" sticky>
-            <TaskForm
-              projectId={currentId}
-              project={current}
+        {creating && (typeof creating === "object" || currentId !== null) && (() => {
+          // A subtask is created where its parent lives, on its base and with its agent; the person can still change them
+          const parent = typeof creating === "object" ? creating : null;
+          const projectId = parent ? parent.project_id : (currentId as number);
+          return (
+          <Modal open onOpenChange={(o) => !o && setCreating(false)} title={parent ? t("app.newSubtaskTitle", { id: parent.id }) : t("app.newTaskTitle")} size="lg" sticky>
+            <NewTaskForm
+              projectId={projectId}
+              project={parent ? list.find((p) => p.id === projectId) : current}
               projects={list}
               allTasks={liveTasks}
+              initial={parent ? { parent_task_id: parent.id, target_branch: parent.target_branch, agent_id: parent.agent_id ?? undefined } : undefined}
               submitLabel={t("app.createTaskSubmit")}
+              rememberBranch={!parent}
               onCancel={() => setCreating(false)}
               pending={createPending}
               onSubmit={(v) => {
@@ -520,7 +721,7 @@ export default function App() {
                 // handling alone and just clear the local pending flag when the request finishes
                 // (successfully or not).
                 runAction(
-                  () => api.addTask({ project_id: currentId, ...v }).finally(() => setCreatePending(false)),
+                  () => api.addTask({ project_id: projectId, ...v }).finally(() => setCreatePending(false)),
                   () => {
                     setCreating(false);
                     void tasks.refresh();
@@ -529,7 +730,8 @@ export default function App() {
               }}
             />
           </Modal>
-        )}
+          );
+        })()}
 
         {forceMove && (
           <Confirm
@@ -602,6 +804,21 @@ export default function App() {
           />
         )}
 
+        {/* Chats float over every page: one button away from anywhere. Below the dialogs
+           (z-30 against their z-40), so a task opened from a proposal covers the window. */}
+        <ChatOverlay
+          chats={chatList}
+          projects={list}
+          selectedId={chatId}
+          onSelect={setChatId}
+          onChanged={() => void chats.refresh()}
+          onOpenTask={openTask}
+          open={ui.chatOpen}
+          onOpenChange={(chatOpen) => setUi({ chatOpen })}
+          expanded={ui.chatExpanded}
+          onExpandedChange={(chatExpanded) => setUi({ chatExpanded })}
+        />
+
         <SettingsDialog
           open={settingsOpen}
           onOpenChange={setSettingsOpen}
@@ -615,7 +832,7 @@ export default function App() {
            that the app is fully responsible for its own messages, including when it is mounted
            in a test. */}
         <Toaster
-          position="bottom-right"
+          position="bottom-center"
           theme={ui.theme}
           closeButton
           toastOptions={{
@@ -629,6 +846,10 @@ export default function App() {
           }}
         />
       </div>
+    </SubtaskProgressContext.Provider>
+    </ManageAgentsContext.Provider>
+    </AgentsContext.Provider>
+    </AppCardSettingsContext.Provider>
     </AppHiddenModelsContext.Provider>
   );
 }

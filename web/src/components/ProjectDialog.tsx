@@ -7,9 +7,12 @@ import { Button } from "../ui/Button";
 import { Field, Input, Select, Textarea, Toggle } from "../ui/Field";
 import { Modal } from "../ui/Modal";
 import { Confirm } from "../ui/Confirm";
+import { AgentPicker } from "./AgentPicker";
 import { EffortPicker } from "./EffortPicker";
 import { ModelPicker } from "./ModelPicker";
 import { ModelVisibility } from "./ModelVisibility";
+import { CardSettingsEditor } from "./CardSettingsEditor";
+import { cleanCardSettings, useAppCardSettings, type CardSettings } from "../cardSettings";
 import { useAppHiddenModels } from "../hiddenModels";
 import { effectiveHiddenModels } from "../models";
 import { PermissionPicker } from "./PermissionPicker";
@@ -34,6 +37,10 @@ interface Draft {
   track_viewed: boolean;
   /** Own list of hidden models. null means as in orc settings. */
   hidden_models: string[] | null;
+  /** The project's lead agent (orc/agents.py). */
+  lead_agent_id: number | null;
+  /** What this project's cards show and start with. null means as in orc settings. */
+  card_settings: CardSettings | null;
 }
 
 const draftOf = (p: Project | null): Draft => ({
@@ -50,6 +57,8 @@ const draftOf = (p: Project | null): Draft => ({
   // Viewing is on for a new project, as on the server (orc/db.py)
   track_viewed: p ? !!p.track_viewed : true,
   hidden_models: p?.hidden_models ?? null,
+  lead_agent_id: p?.lead_agent_id ?? null,
+  card_settings: p?.card_settings ?? null,
 });
 
 // The hidden-models list is an array: comparing by reference would always consider it changed
@@ -241,6 +250,7 @@ export function ProjectDialog({ open, onOpenChange, project, onSaved }: Props) {
     (k) => k !== "path" && !sameValue(base[k], draft[k]),
   );
   const appHiddenModels = useAppHiddenModels();
+  const appCardSettings = useAppCardSettings();
   const hiddenModels = effectiveHiddenModels(draft, appHiddenModels);
   // Both locations can be edited at once, so a list of changed files goes to saving, not a single
   // text. An unreadable file (error) never gets into this list.
@@ -337,6 +347,8 @@ export function ProjectDialog({ open, onOpenChange, project, onSaved }: Props) {
             push_enabled: draft.push_enabled ? 1 : 0,
             track_viewed: draft.track_viewed ? 1 : 0,
             hidden_models: draft.hidden_models,
+            lead_agent_id: draft.lead_agent_id,
+            card_settings: cleanCardSettings(draft.card_settings),
           });
       onSaved(saved);
       onOpenChange(false);
@@ -449,25 +461,20 @@ export function ProjectDialog({ open, onOpenChange, project, onSaved }: Props) {
           )}
         </Section>
 
+        {/* Tasks run on agents, and an agent carries its own model, effort and permission mode, so
+           this section is only about who leads the project and how many agents work at once. */}
         <Section title={t("projectDialog.runSection")} hint={t("projectDialog.runSectionHint")}>
-          <div className="grid grid-cols-2 gap-3">
-            <ModelPicker
-              value={draft.default_model}
-              defaultLabel={t("projectDialog.claudeDecides")}
-              hidden={hiddenModels}
-              onChange={(m) => set("default_model", m)}
+          {/* A new project has no id for an internal agent yet, so a lead is appointed afterwards. */}
+          {!creating && (
+            <AgentPicker
+              projectId={project.id}
+              value={draft.lead_agent_id}
+              onChange={(next) => set("lead_agent_id", next)}
+              label={t("agents.lead.label")}
+              noneLabel={t("agents.lead.none")}
+              hint={t("agents.lead.hint")}
             />
-            <EffortPicker
-              value={draft.default_effort}
-              defaultLabel={t("projectDialog.claudeDecides")}
-              onChange={(v) => set("default_effort", v)}
-            />
-          </div>
-          {/* There is no empty option here: a project always has a mode, tasks inherit it. */}
-          <PermissionPicker
-            value={draft.default_permission_mode}
-            onChange={(next) => set("default_permission_mode", next ?? "auto")}
-          />
+          )}
           <Field label={t("projectDialog.maxWorkersLabel")} hint={t("projectDialog.maxWorkersHint")}>
             <Input
               type="number"
@@ -479,22 +486,74 @@ export function ProjectDialog({ open, onOpenChange, project, onSaved }: Props) {
           </Field>
         </Section>
 
-        {/* Own model visibility: off means the project shows the same as configured in orc.
-           Turning it on copies the shared list as a starting point, so editing starts from what
-           the person sees now rather than from an empty "everything visible". */}
-        <Section title={t("projectDialog.modelsSection")} hint={t("projectDialog.modelsSectionHint")}>
-          <Toggle
-            checked={draft.hidden_models !== null}
-            onChange={(on) => set("hidden_models", on ? [...appHiddenModels] : null)}
-            label={t("projectDialog.ownModelListLabel")}
-            hint={t("projectDialog.ownModelListHint")}
-          />
-          <ModelVisibility
-            hidden={hiddenModels}
-            disabled={draft.hidden_models === null}
-            onChange={(next) => set("hidden_models", next)}
-          />
-        </Section>
+        {/* The project's own model, effort and mode are only a fallback for an agent that sets none
+           of its own, so they are tucked away and absent when creating: a new project starts with
+           "as Claude Code decides" and the agents choose. The details element keeps its fields
+           mounted when closed, so the draft and the dirty check see them either way. */}
+        {!creating && (
+          <details className="group rounded-[var(--radius-sm)] border border-[var(--line)]">
+            <summary className="cursor-pointer select-none px-3 py-2.5">
+              <span className="text-[13px] font-semibold text-[var(--ink)]">{t("projectDialog.fallbackSection")}</span>
+              <span className="mt-0.5 block text-[11px] leading-snug text-[var(--ink-faint)]">{t("projectDialog.fallbackSectionHint")}</span>
+            </summary>
+            <div className="space-y-5 border-t border-[var(--line)] p-3">
+              <div className="space-y-3">
+                <div className="grid grid-cols-2 gap-3">
+                  <ModelPicker
+                    value={draft.default_model}
+                    defaultLabel={t("projectDialog.claudeDecides")}
+                    hidden={hiddenModels}
+                    onChange={(m) => set("default_model", m)}
+                  />
+                  <EffortPicker
+                    value={draft.default_effort}
+                    defaultLabel={t("projectDialog.claudeDecides")}
+                    onChange={(v) => set("default_effort", v)}
+                  />
+                </div>
+                {/* There is no empty option here: a project always has a mode. */}
+                <PermissionPicker
+                  value={draft.default_permission_mode}
+                  onChange={(next) => set("default_permission_mode", next ?? "auto")}
+                />
+              </div>
+              {/* Own model visibility: off means the project shows the same as configured in orc.
+                 Turning it on copies the shared list as a starting point. */}
+              <Section title={t("projectDialog.modelsSection")} hint={t("projectDialog.modelsSectionHint")}>
+                <Toggle
+                  checked={draft.hidden_models !== null}
+                  onChange={(on) => set("hidden_models", on ? [...appHiddenModels] : null)}
+                  label={t("projectDialog.ownModelListLabel")}
+                  hint={t("projectDialog.ownModelListHint")}
+                />
+                <ModelVisibility
+                  hidden={hiddenModels}
+                  disabled={draft.hidden_models === null}
+                  onChange={(next) => set("hidden_models", next)}
+                />
+              </Section>
+            </div>
+          </details>
+        )}
+
+        {/* Only for a project that exists: a default agent may be internal to it. Off means the cards
+           follow orc; turning it on copies the shared settings as a starting point, as with the models. */}
+        {project && (
+          <Section title={t("card.settings.heading")} hint={t("card.settings.headingHint")}>
+            <Toggle
+              checked={draft.card_settings !== null}
+              onChange={(on) => set("card_settings", on ? { ...appCardSettings } : null)}
+              label={t("card.settings.ownLabel")}
+              hint={t("card.settings.ownHint")}
+            />
+            <CardSettingsEditor
+              projectId={project.id}
+              disabled={draft.card_settings === null}
+              value={draft.card_settings ?? appCardSettings}
+              onChange={(next) => set("card_settings", next)}
+            />
+          </Section>
+        )}
 
         {/* The base branch answers "where does work come from and go to": each new task's
            worktree is branched from it and the merge goes into it. Creating, renaming and

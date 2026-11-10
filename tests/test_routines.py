@@ -152,3 +152,66 @@ def test_delete_routine_keeps_runs_as_plain_tasks(repo, dispatcher, project, clo
     assert repo.get_routine(r.id) is None
     kept = repo.get_task(run.id)
     assert kept is not None and kept.routine_id is None and kept.routine_run == 1
+
+
+# ---------- a routine outside a project: the schedule makes chats ----------
+
+def test_due_free_routine_makes_a_chat_and_skips_while_it_is_active(repo, dispatcher, fake_cli, clock):
+    agent = repo.add_agent("Ann")
+    r = repo.add_routine(None, "Digest", description="read the news", schedule_kind="interval",
+                         interval_minutes=60, next_run_at=iso(NOW), agent_id=agent.id)
+    dispatcher.tick()
+    chats = repo.routine_chats(r.id)
+    assert [(c.routine_run, c.project_id, c.title) for c in chats] == [(1, None, "Digest · #1")]
+    assert repo.list_tasks() == []  # no card on any board
+    assert repo.get_routine(r.id).next_run_at == iso(NOW + timedelta(hours=1))
+
+    # The next slot while the chat run is not finished: skipped, not piled up
+    clock["now"] = NOW + timedelta(hours=1, minutes=1)
+    repo.update_chat(chats[0].id, status="running")
+    dispatcher.tick()
+    assert len(repo.routine_chats(r.id)) == 1 and repo.get_routine(r.id).skipped_count == 1
+
+    # After the chat is idle again the following slot makes the second run
+    clock["now"] = NOW + timedelta(hours=2, minutes=1)
+    repo.update_chat(chats[0].id, status="idle")
+    dispatcher.tick()
+    assert [c.routine_run for c in repo.routine_chats(r.id)] == [2, 1]
+
+
+def test_free_routine_ignores_hidden_projects_and_stops_at_the_ceiling(repo, dispatcher, fake_cli, project, clock):
+    agent = repo.add_agent("Ann")
+    repo.update_project(project.id, archived_at=iso(NOW))  # an archived project must not matter to a free routine
+    r = repo.add_routine(None, "Once", description="x", schedule_kind="interval", interval_minutes=60,
+                         next_run_at=iso(NOW), agent_id=agent.id, max_runs=1)
+    dispatcher.tick()
+    fresh = repo.get_routine(r.id)
+    assert len(repo.routine_chats(r.id)) == 1 and not fresh.enabled and fresh.next_run_at is None
+
+
+def test_free_routine_without_an_agent_is_paused_with_an_event(repo, dispatcher, clock):
+    r = repo.add_routine(None, "Broken", description="x", schedule_kind="interval", interval_minutes=60,
+                         next_run_at=iso(NOW))
+    dispatcher.tick()
+    assert not repo.get_routine(r.id).enabled and repo.routine_chats(r.id) == []
+    assert any("needs an agent" in e["message"] for e in repo.list_events())
+
+
+def test_free_routine_slot_is_passed_over_while_dispatcher_is_paused(repo, dispatcher, clock):
+    agent = repo.add_agent("Ann")
+    r = repo.add_routine(None, "Digest", description="x", schedule_kind="interval", interval_minutes=60,
+                         next_run_at=iso(NOW), agent_id=agent.id)
+    repo.set_setting("dispatcher_paused", "1")
+    dispatcher.tick()
+    # No session is started behind the owner's back; the schedule moves on, nothing is caught up later
+    assert repo.routine_chats(r.id) == []
+    assert repo.get_routine(r.id).next_run_at == iso(NOW + timedelta(hours=1))
+
+
+def test_free_routine_with_a_project_agent_is_paused_with_an_event(repo, dispatcher, project, clock):
+    agent = repo.add_agent("Inner", project_id=project.id)
+    r = repo.add_routine(None, "Digest", description="x", schedule_kind="interval", interval_minutes=60,
+                         next_run_at=iso(NOW), agent_id=agent.id)
+    dispatcher.tick()
+    assert not repo.get_routine(r.id).enabled and repo.routine_chats(r.id) == []
+    assert any("belongs to a project" in e["message"] for e in repo.list_events())

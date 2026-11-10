@@ -6,7 +6,7 @@ from pathlib import Path
 
 from orc import git_ops
 from orc.models import TaskStatus
-from orc.report import REPORT_REL_PATH
+from orc.handoff import REPORT_REL_PATH
 
 
 def _worker_commits(task, file_name="feature.txt", text="implemented\n"):

@@ -136,7 +136,7 @@ export const pagesFr: PagesDictionary = {
     risks: {
       noHuman: {
         title: "Aucun humain entre l'agent et origin",
-        body: "La fusion, et le push s'il est activé, suivent le rapport que l'agent écrit lui-même. `verify_cmd` est la seule voix indépendante.",
+        body: "La fusion, et le push s'il est activé, suivent la parole de l'agent lui-même que le travail est fait. `verify_cmd` est la seule voix indépendante.",
       },
       verifyEdited: {
         title: "verify_cmd exécute du code que l'agent vient de modifier",
@@ -210,7 +210,7 @@ export const pagesFr: PagesDictionary = {
         steps: {
           s1: "Nom et chemin du dépôt. Un dossier sans git ? orc propose de lancer `git init` avec un premier commit vide sur main.",
           s2: "« Agents à la fois » — combien de tâches de ce projet tournent en parallèle. Les réglages d'orc ont aussi un plafond global.",
-          s3: "« Comment lancer les agents » — modèle, effort et mode de permission par défaut pour les nouvelles tâches. Chaque tâche peut les remplacer.",
+          s3: "« Agents » — qui dirige le projet et combien tournent à la fois. Modèle, effort et mode de permission se règlent sur chaque agent ; les valeurs du projet (« Réglages de repli », dans les réglages du projet) ne servent qu'à un agent qui n'en a pas.",
           s4: "« Branche de base » — d'où partent les branches des tâches et où les résultats sont fusionnés. Vide signifie la branche actuellement extraite dans le dépôt.",
           s5: "« Vérification avant fusion » — la commande de vérification (par exemple `make test`) et son délai. C'est le principal garde-fou : sans elle, la fusion se fie uniquement à la parole de l'agent.",
           s6: "« Après la fusion » — push vers origin. Désactivé par défaut : orc ne pousse jamais de lui-même tant que tu ne l'actives pas.",
@@ -226,12 +226,26 @@ export const pagesFr: PagesDictionary = {
         steps: {
           s1: "Titre — un nom court pour le tableau.",
           s2: "« Tâche pour l'agent » — quoi faire, où ça se trouve et comment le vérifier. Colle les captures d'écran là où elles ont leur place : Ctrl+V, glisser-déposer ou le bouton « Image ». « Texte / Aperçu » montre ce que l'agent verra.",
-          s3: "« Paramètres d'exécution » — modèle, effort et mode de permission. Un champ vide reprend la valeur du projet et la suit si le projet change.",
+          s3: "«Responsable» — l'agent qui fait le travail. Le modèle, l'effort et le mode de permissions viennent de l'agent ; une carte sans responsable reste à toi et ne part pas au travail.",
           s4: "Modes de permission : `auto` — Claude décide lui-même ; `acceptEdits` — modifie les fichiers sans demander ; `dontAsk` — ne demande jamais, et ce qui n'est pas pré-autorisé ne s'exécute tout simplement pas ; `bypassPermissions` — aucune vérification, uniquement pour tes propres dépôts.",
-          s5: "Priorité, branche de base et « Bloquée par des tâches » : une tâche dépendante attend que les tâches dont elle dépend soient terminées, même dans d'autres projets.",
+          s5: "Priorité, branche de base et «Attend» : une carte attend que les cartes dont elle dépend soient fusionnées, même dans d'autres projets. «Ajouter une propriété» ajoute des étiquettes et des dates de plan, que la file ne lit jamais.",
           s6: "Laisse la carte dans « Arriéré » comme une note, ou mets-la dans « À faire » — le répartiteur la prend au cycle suivant. Une carte sans consigne ne peut pas aller dans « À faire ».",
         },
         tip: "La branche de base peut être changée tant que la carte est dans « Arriéré » ou « À faire ». Une fois la tâche lancée, la copie de travail existe déjà et c'est trop tard.",
+      },
+      card: {
+        title: "La carte",
+        where: "Clic sur une carte du tableau",
+        intro: "Une carte décrit le travail une fois, et tout ce qui se passe entre toi et l'agent a lieu dans sa conversation. La colonne de gauche sert à lire, celle de droite aux faits.",
+        steps: {
+          s1: "La description reste à sa place : une question de l'agent ne la repousse jamais. Clique pour la modifier ; le champ grandit avec le texte.",
+          s2: "«Relations» : ce que la carte attend, ce qui vient ensuite, et ses sous-tâches avec un anneau faites/total. «+» crée une sous-tâche avec le projet, la branche et l'agent du parent ; «Liste / Arbre» montre toute la chaîne autour de la carte.",
+          s3: "«Conversation» : les messages et commandes de la session et les étapes ajoutées par orc — remis, vérification, fusion, conflit. Le champ de saisie dessous suit l'état : «Envoyer à l'agent» tant que l'agent travaille ou attend, «Continuer» et «Réessayer» après un échec, «Reprendre» quand la carte est terminée.",
+          s4: "«Note, invisible pour l'agent» reste sur la carte et n'atteint jamais la session.",
+          s5: "La colonne de droite : statut, responsable, priorité, branche et les propriétés ajoutées. Le «Journal d'exécution» liste chaque exécution avec sa raison, son issue et son coût, et chaque vérification avec sa sortie.",
+          s6: "«Détails» en bas : qui a créé la carte, quand elle a commencé et fini, sa branche, son worktree et la commande pour rejoindre la session.",
+        },
+        tip: "Une carte s'ouvre en haut, pour lire la tâche. Elle s'ouvre à la fin de la conversation quand elle t'attend, et la puce de l'agent dans l'en-tête y mène aussi.",
       },
       dispatcher: {
         title: "Ce que fait le répartiteur",
@@ -240,7 +254,7 @@ export const pagesFr: PagesDictionary = {
         steps: {
           s1: "Prend des tâches dans « À faire » tant qu'il y a des places libres et crée un worktree avec la branche `orc/task-<id>` à partir de la branche de base de la tâche.",
           s2: "Y lance `claude --bg` avec ta consigne, ton modèle et ton mode de permission. La carte passe dans « En cours ».",
-          s3: "Quand la session se termine, lit `.orchestrator/report.json`. Si l'agent signale un échec, la tâche revient avec son explication.",
+          s3: "Attend que l'agent lance `orc task done` et termine son tour. S'il lance `orc task fail`, la tâche s'arrête avec sa raison. S'il ne fait ni l'un ni l'autre, la carte vous attend. S'il lance `orc task wakeup`, la carte dort sans créneau de worker jusqu'à son réveil.",
           s4: "Lance `verify_cmd` dans le worktree — le badge « vérification ». Rouge : la tâche retourne à l'agent avec la sortie de la vérification.",
           s5: "Vert : la tâche rejoint la file de fusion — le badge « fusion » : `--no-ff` dans la branche de base, une tâche à la fois. Puis « Terminé ».",
           s6: "Le panneau du répartiteur affiche le pouls et les agents occupés. « Pause » arrête la distribution de nouvelles tâches ; « Lancer maintenant » fait un passage sans attendre le minuteur.",
@@ -253,10 +267,11 @@ export const pagesFr: PagesDictionary = {
         intro: "Le magenta est la seule couleur de l'interface qui appelle un humain. Une carte qui a besoin de toi remonte en haut de sa colonne et reçoit un badge.",
         steps: {
           s1: "L'agent a demandé une autorisation, posé une question ou proposé un plan — la carte reçoit « attend une réponse », et le compteur de l'en-tête augmente.",
-          s2: "Ouvre la carte : la question de l'agent est en haut. Réponds dans « Réponse à Claude » — les captures d'écran fonctionnent ici aussi.",
+          s2: "Ouvre la carte. Une permission, un choix ou un plan arrive sous forme de formulaire à la fin de la conversation, à la place du champ de saisie. Une simple question est le dernier message de l'agent, marqué «Attend votre réponse» : réponds dans le champ de saisie — les captures d'écran marchent ici aussi.",
           s3: "La réponse arrive dans la même session en quelques secondes, et celle-ci reprend là où elle s'était arrêtée.",
-          s4: "Tu peux écrire à une session au travail sans qu'on te le demande : le bouton « À la session » à côté du champ de note. Le texte arrive à son prochain appel d'outil sans l'interrompre.",
-          s5: "Si la session ne récupère pas le message pendant quelques minutes, la carte le signale et propose « Interrompre la session » — le texte est alors livré avec un redémarrage.",
+          s4: "Tu peux écrire à une session en cours sans qu'elle demande : «Envoyer à l'agent» dans le champ de saisie. Le texte arrive à son prochain appel d'outil sans l'interrompre ; «Interrompre» arrête d'abord l'étape en cours, comme Échap.",
+          s5: "Un message en route affiche son état en dessous : «attend la prochaine étape de l'agent», puis «lu». Si l'agent est pris par une longue étape, «Interrompre» l'arrête, comme Échap, et il lit ton message plus tôt.",
+          s6: "L'agent remet son travail avec `orc task done`. S'il s'est arrêté sans le faire et que le travail semble fini, «Accepter le travail» à côté de «Envoyer à l'agent» le remet à sa place : la vérification a lieu quand même.",
         },
         tip: "Les questions des autres projets apparaissent comme une puce séparée dans la même barre — le répartiteur est commun, donc rien ne se perd.",
       },
@@ -266,7 +281,7 @@ export const pagesFr: PagesDictionary = {
         intro: "La plupart des problèmes se règlent sans toi. Voici ce qu'orc fait seul et quand il t'appelle.",
         steps: {
           s1: "Conflit de fusion : la tâche qui arrive en second trouve les modifications d'une autre dans ses fichiers. orc renvoie le conflit à la session qui a écrit le code ; elle le résout selon le sens, repasse la vérification et retourne dans la file de fusion. Après trois tentatives — le badge « conflit ».",
-          s2: "Une tâche échouée est rouge, et la raison est dans la carte. « Réessayer » repart de zéro ; « Reprendre la session » continue la même session.",
+          s2: "Une tâche échouée est rouge, et la raison est dans sa conversation. «Continuer» reprend la même session, avec ton message si tu en écris un ; «Réessayer» repart de zéro ; «Accepter le travail» envoie ce qu'a fait la session à la vérification.",
           s3: "Quota : quand la limite Claude est atteinte, la tâche attend avec le badge « quota », et le répartiteur la reprend après la réinitialisation.",
           s4: "« non approuvé » : Claude Code ne lance pas de sessions dans un dossier que tu n'as pas approuvé. « Faire confiance au dossier et lancer » règle ça une fois par projet.",
           s5: "« copie modifiée » : la branche cible a une fusion, un rebase ou un cherry-pick inachevé. orc n'y touche pas — termine l'opération, et la tâche continue.",
@@ -361,7 +376,7 @@ export const pagesFr: PagesDictionary = {
         c1: "Il y a une place libre — la tâche est prise dans la file.",
         c2: "Un worktree et une branche séparés sont créés pour elle.",
         c3: "`claude --bg` démarre avec ta consigne.",
-        c4: "La session se termine et écrit son rapport.",
+        c4: "La session lance `orc task done` et termine son tour.",
         c5: "`verify_cmd` s'exécute dans le worktree de la tâche.",
         c6: "Fusion dans la branche de base, une tâche à la fois.",
       },
@@ -375,8 +390,8 @@ export const pagesFr: PagesDictionary = {
       captions: {
         c1: "L'agent travaille.",
         c2: "Il a une question : la carte devient magenta et remonte.",
-        c3: "Tu ouvres la carte et vois la question.",
-        c4: "Tu réponds dans « Réponse à Claude ».",
+        c3: "Tu ouvres la carte : la question est son dernier message.",
+        c4: "Tu réponds dans le champ de saisie juste en dessous.",
         c5: "La réponse arrive dans la même session, et le travail continue.",
       },
     },

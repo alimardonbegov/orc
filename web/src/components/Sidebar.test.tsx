@@ -151,3 +151,88 @@ it("a project has an unviewed-results counter, only where viewing is tracked", (
   expect(within(screen.getByRole("button", { name: /Alpha/ })).getByTitle("not viewed: 2")).toHaveTextContent("2");
   expect(within(screen.getByRole("button", { name: /Beta/ })).queryByTitle(/not viewed/)).not.toBeInTheDocument();
 });
+
+describe("cards in work under their project", () => {
+  const card = (id: number, projectId: number, status: Task["status"], title = `Card ${id}`, extra: Partial<Task> = {}) =>
+    ({ id, project_id: projectId, title, status, blocker: null, archived_at: null, agent_id: null, ...extra }) as Task;
+  const renderWith = (tasks: Task[], props: Record<string, unknown> = {}) =>
+    render(<Sidebar projects={[project(1, "Alpha"), project(2, "Beta")]} onSelect={vi.fn()} onReorderProjects={vi.fn()} {...baseProps} tasks={tasks} {...props} />);
+
+  it("a project whose only card sleeps until a wakeup still shows a counter", () => {
+    renderWith([card(7, 1, "in_progress", "Asleep", { blocker: "sleeping" })]);
+    const row = screen.getByRole("button", { name: /Alpha/ });
+    expect(within(row).getByTitle("asleep: 1")).toHaveTextContent("1");
+    expect(within(row).queryByTitle(/running/)).not.toBeInTheDocument();
+  });
+
+  it("lists running cards of a project open by default, with their numbers", () => {
+    renderWith([card(7, 1, "in_progress"), card(8, 1, "verifying"), card(9, 1, "todo"), card(10, 2, "done")]);
+    expect(screen.getByRole("button", { name: /#7/ })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /#8/ })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /#9/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /#10/ })).not.toBeInTheDocument();
+  });
+
+  it("shows nothing for a project without running cards and in the collapsed rail", () => {
+    const { unmount } = renderWith([card(9, 1, "todo")]);
+    expect(screen.queryByRole("button", { name: "Hide running cards" })).not.toBeInTheDocument();
+    unmount();
+    renderWith([card(7, 1, "in_progress")], { collapsed: true });
+    expect(screen.queryByRole("button", { name: /#7/ })).not.toBeInTheDocument();
+  });
+
+  it("clicking a card opens it without selecting the project row", async () => {
+    const user = userEvent.setup();
+    const onOpenTask = vi.fn();
+    const onSelect = vi.fn();
+    renderWith([card(7, 1, "in_progress")], { onOpenTask, onSelect });
+    await user.click(screen.getByRole("button", { name: /#7/ }));
+    expect(onOpenTask).toHaveBeenCalledWith(7);
+    expect(onSelect).not.toHaveBeenCalled();
+  });
+
+  it("has no extra heading line: the chevron sits in the project row itself", () => {
+    renderWith([card(7, 1, "in_progress")]);
+    expect(screen.queryByText(/In work/)).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Hide running cards" })).toHaveAttribute("aria-expanded", "true");
+  });
+
+  it("folds and unfolds the list, and remembers the choice", async () => {
+    const user = userEvent.setup();
+    localStorage.clear();
+    const { unmount } = renderWith([card(7, 1, "in_progress")]);
+    await user.click(screen.getByRole("button", { name: "Hide running cards" }));
+    expect(screen.queryByRole("button", { name: /#7/ })).not.toBeInTheDocument();
+    unmount();
+    renderWith([card(7, 1, "in_progress")]);
+    expect(screen.queryByRole("button", { name: /#7/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Show running cards" }));
+    expect(screen.getByRole("button", { name: /#7/ })).toBeInTheDocument();
+    localStorage.clear();
+  });
+
+  it("shows the first three and opens the rest on request", async () => {
+    const user = userEvent.setup();
+    localStorage.clear();
+    renderWith([1, 2, 3, 4, 5].map((id) => card(id, 1, "in_progress")));
+    expect(screen.queryByRole("button", { name: /#4/ })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Show all (5)" }));
+    expect(screen.getByRole("button", { name: /#5/ })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Show fewer" }));
+    expect(screen.queryByRole("button", { name: /#5/ })).not.toBeInTheDocument();
+  });
+
+  it("a card that waits for a human does not pulse", () => {
+    renderWith([card(7, 1, "in_progress"), card(8, 1, "in_progress", "Stuck", { blocker: "question" as Task["blocker"] })]);
+    const dots = screen.getAllByTestId("running-dot");
+    expect(dots[0].className).toContain("animate-pulse");
+    expect(dots[1].className).not.toContain("animate-pulse");
+  });
+
+  it("a card disappears from the list once it stops running", () => {
+    const { rerender } = renderWith([card(7, 1, "in_progress")]);
+    expect(screen.getByRole("button", { name: /#7/ })).toBeInTheDocument();
+    rerender(<Sidebar projects={[project(1, "Alpha")]} onSelect={vi.fn()} onReorderProjects={vi.fn()} {...baseProps} tasks={[card(7, 1, "done")]} />);
+    expect(screen.queryByRole("button", { name: /#7/ })).not.toBeInTheDocument();
+  });
+});

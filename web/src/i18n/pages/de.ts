@@ -136,7 +136,7 @@ export const pagesDe: PagesDictionary = {
     risks: {
       noHuman: {
         title: "Kein Mensch zwischen Agent und origin",
-        body: "Merge und, falls eingeschaltet, Push folgen dem Bericht, den der Agent selbst schreibt. `verify_cmd` ist die einzige unabhängige Stimme.",
+        body: "Merge und, falls eingeschaltet, Push folgen dem Wort des Agenten selbst, dass die Arbeit fertig ist. `verify_cmd` ist die einzige unabhängige Stimme.",
       },
       verifyEdited: {
         title: "verify_cmd führt Code aus, den der Agent gerade bearbeitet hat",
@@ -210,7 +210,7 @@ export const pagesDe: PagesDictionary = {
         steps: {
           s1: "Name und Repository-Pfad. Ein Ordner ohne git? orc bietet an, `git init` mit einem leeren ersten Commit auf main auszuführen.",
           s2: "„Agenten gleichzeitig“ — wie viele Aufgaben dieses Projekts parallel laufen. Die orc-Einstellungen haben zusätzlich eine globale Obergrenze.",
-          s3: "„Wie Agenten gestartet werden“ — Standardmodell, Aufwand und Berechtigungsmodus für neue Aufgaben. Jede Aufgabe kann sie überschreiben.",
+          s3: "«Agenten» — wer das Projekt leitet und wie viele gleichzeitig laufen. Modell, Aufwand und Berechtigungsmodus stellt jeder Agent selbst ein; die Werte des Projekts («Ausweich-Startwerte» in den Projekteinstellungen) gelten nur für einen Agenten ohne eigene.",
           s4: "„Basis-Branch“ — wovon Aufgaben-Branches abzweigen und wohin die Ergebnisse zurückfließen. Leer bedeutet den Branch, der gerade im Repository ausgecheckt ist.",
           s5: "„Prüfung vor dem Merge“ — der Verify-Befehl (zum Beispiel `make test`) und sein Zeitlimit. Das ist die wichtigste Sicherung: Ohne sie verlässt sich der Merge nur auf das Wort des Agenten.",
           s6: "„Nach dem Merge“ — Push zu origin. Standardmäßig aus: orc pusht nie von selbst, bis du es einschaltest.",
@@ -226,12 +226,26 @@ export const pagesDe: PagesDictionary = {
         steps: {
           s1: "Titel — ein kurzer Name für das Board.",
           s2: "„Aufgabe für den Agenten“ — was zu tun ist, wo es liegt und wie es zu prüfen ist. Füge Screenshots genau dort ein, wo sie hingehören: Strg+V, per Drag-and-Drop oder mit dem Button „Bild“. „Text / Vorschau“ zeigt, was der Agent sehen wird.",
-          s3: "„Ausführungsparameter“ — Modell, Aufwand und Berechtigungsmodus. Ein leeres Feld übernimmt den Projektwert und folgt ihm, wenn sich das Projekt ändert.",
+          s3: "«Zuständig» — der Agent, der die Arbeit macht. Modell, Aufwand und Berechtigungsmodus kommen vom Agenten; eine Karte ohne Zuständigen gehört dir und geht nicht an die Arbeit.",
           s4: "Berechtigungsmodi: `auto` — Claude entscheidet selbst; `acceptEdits` — bearbeitet Dateien ohne Nachfrage; `dontAsk` — fragt nie, und was nicht vorab freigegeben ist, wird einfach nicht ausgeführt; `bypassPermissions` — gar keine Prüfungen, nur für eigene Repositories.",
-          s5: "Priorität, Basis-Branch und „Wartet auf Aufgaben“: Eine abhängige Aufgabe wartet, bis die Aufgaben, von denen sie abhängt, fertig sind — auch in anderen Projekten.",
+          s5: "Priorität, Basis-Branch und «Wartet auf»: eine Karte wartet, bis die Karten, von denen sie abhängt, gemergt sind, auch in anderen Projekten. «Eigenschaft hinzufügen» ergänzt Labels und Plandaten, die die Warteschlange nie liest.",
           s6: "Lass die Karte als Notiz im „Rückstand“ oder leg sie nach „Zu erledigen“ — der Dispatcher übernimmt sie beim nächsten Zyklus. Eine Karte mit leerem Auftrag kann nicht nach „Zu erledigen“.",
         },
         tip: "Den Basis-Branch kannst du ändern, solange die Karte im „Rückstand“ oder in „Zu erledigen“ liegt. Sobald die Aufgabe startet, existiert die Arbeitskopie bereits, und es ist zu spät.",
+      },
+      card: {
+        title: "Die Karte",
+        where: "Klick auf eine Karte im Board",
+        intro: "Eine Karte beschreibt die Arbeit einmal, und alles zwischen dir und dem Agenten passiert in ihrer Konversation. Die linke Spalte ist zum Lesen, die rechte für Fakten.",
+        steps: {
+          s1: "Die Beschreibung bleibt, wo sie ist: eine Frage des Agenten schiebt sie nie beiseite. Klick zum Bearbeiten; das Feld wächst mit dem Text.",
+          s2: "«Beziehungen»: worauf die Karte wartet, was danach kommt, und ihre Unteraufgaben mit einem Ring erledigt/gesamt. «+» legt eine Unteraufgabe mit Projekt, Branch und Agent der Elternkarte an; «Liste / Baum» zeigt die ganze Kette um die Karte.",
+          s3: "«Konversation»: Nachrichten und Befehle der Sitzung und die Etappen, die orc ergänzt — abgegeben, Prüfung, Merge, Konflikt. Das Eingabefeld darunter folgt dem Zustand: «An Agenten senden», solange der Agent arbeitet oder wartet, «Fortsetzen» und «Erneut versuchen» nach einem Fehler, «Weiterbearbeiten», wenn die Karte fertig ist.",
+          s4: "«Notiz, der Agent sieht sie nicht» bleibt an der Karte und erreicht die Sitzung nie.",
+          s5: "Die rechte Spalte: Status, Zuständig, Priorität, Branch und die hinzugefügten Eigenschaften. Das «Ausführungsprotokoll» listet jeden Lauf mit Anlass, Ausgang und Kosten, und jede Prüfung mit ihrer Ausgabe.",
+          s6: "«Details» unten: wer die Karte angelegt hat, wann sie begann und endete, ihr Branch, ihr Worktree und der Befehl, um sich an die Sitzung anzuhängen.",
+        },
+        tip: "Eine Karte öffnet sich oben, um die Aufgabe zu lesen. Am Ende der Konversation öffnet sie sich, wenn sie auf dich wartet, und der Agenten-Chip im Kopf führt ebenfalls dorthin.",
       },
       dispatcher: {
         title: "Was der Dispatcher tut",
@@ -240,7 +254,7 @@ export const pagesDe: PagesDictionary = {
         steps: {
           s1: "Nimmt Aufgaben aus „Zu erledigen“, solange Plätze frei sind, und erstellt einen Worktree mit dem Branch `orc/task-<id>` aus dem Basis-Branch der Aufgabe.",
           s2: "Startet dort `claude --bg` mit deinem Auftrag, Modell und Berechtigungsmodus. Die Karte wandert nach „In Arbeit“.",
-          s3: "Wenn die Sitzung endet, liest er `.orchestrator/report.json`. Meldet der Agent einen Fehlschlag, kommt die Aufgabe mit seiner Erklärung zurück.",
+          s3: "Wartet, bis der Agent `orc task done` aufruft und seinen Zug beendet. Ruft er `orc task fail` auf, stoppt die Aufgabe mit seiner Begründung. Tut er keines von beiden, wartet die Karte auf dich. Ruft er `orc task wakeup` auf, schläft die Karte ohne Worker-Slot bis zu ihrem Weckruf.",
           s4: "Führt `verify_cmd` im Worktree aus — das Badge „Prüfung“. Rot: Die Aufgabe geht mit der Ausgabe der Prüfung an den Agenten zurück.",
           s5: "Grün: Die Aufgabe reiht sich in die Merge-Warteschlange ein — das Badge „Merge“: `--no-ff` in den Basis-Branch, eine Aufgabe nach der anderen. Dann „Fertig“.",
           s6: "Das Dispatcher-Panel zeigt den Herzschlag und beschäftigte Agenten. „Pause“ stoppt die Verteilung neuer Aufgaben; „Jetzt ausführen“ macht einen Durchlauf, ohne auf den Timer zu warten.",
@@ -253,10 +267,11 @@ export const pagesDe: PagesDictionary = {
         intro: "Magenta ist die einzige Farbe in der Oberfläche, die einen Menschen ruft. Eine Karte, die dich braucht, rückt an den Anfang ihrer Spalte und bekommt ein Badge.",
         steps: {
           s1: "Der Agent hat um Erlaubnis gebeten, eine Frage gestellt oder einen Plan vorgeschlagen — die Karte bekommt „wartet auf Antwort“, und der Zähler im Kopf steigt.",
-          s2: "Öffne die Karte: Die Frage des Agenten steht oben. Antworte in „Antwort an Claude“ — auch hier funktionieren Screenshots.",
+          s2: "Öffne die Karte. Eine Berechtigung, eine Auswahl oder ein Plan kommt als Formular am Ende der Konversation, anstelle des Eingabefelds. Eine einfache Frage ist die letzte Nachricht des Agenten, markiert mit «Wartet auf deine Antwort»: antworte im Eingabefeld — Screenshots gehen auch hier.",
           s3: "Die Antwort geht binnen Sekunden an dieselbe Sitzung, und sie macht dort weiter, wo sie aufgehört hat.",
-          s4: "Du kannst einer arbeitenden Sitzung auch ungefragt schreiben: mit dem Button „An die Sitzung“ neben dem Notizfeld. Der Text kommt bei ihrem nächsten Werkzeugaufruf an, ohne sie zu unterbrechen.",
-          s5: "Holt die Sitzung die Nachricht ein paar Minuten lang nicht ab, sagt die Karte das und bietet „Sitzung unterbrechen“ an — dann wird der Text mit einem Neustart zugestellt.",
+          s4: "Du kannst einer laufenden Sitzung auch ungefragt schreiben: «An Agenten senden» im Eingabefeld. Der Text kommt beim nächsten Werkzeugaufruf an, ohne sie zu unterbrechen; «Unterbrechen» stoppt zuerst den laufenden Schritt, wie Esc.",
+          s5: "Eine Nachricht unterwegs zeigt darunter ihren Status: «wartet auf den nächsten Schritt des Agenten», dann «gelesen». Steckt der Agent in einem langen Schritt, stoppt «Unterbrechen» ihn wie Esc, damit er deine Nachricht früher liest.",
+          s6: "Der Agent gibt seine Arbeit mit `orc task done` ab. Hat er ohne aufgehört und sieht die Arbeit fertig aus, gibt «Arbeit annehmen» neben «An Agenten senden» sie für ihn ab: die Prüfung läuft trotzdem.",
         },
         tip: "Fragen aus anderen Projekten erscheinen als separater Chip in derselben Leiste — der Dispatcher ist gemeinsam, also geht nichts verloren.",
       },
@@ -266,7 +281,7 @@ export const pagesDe: PagesDictionary = {
         intro: "Die meisten Probleme lösen sich ohne dich. Das erledigt orc von selbst — und dann ruft es dich.",
         steps: {
           s1: "Merge-Konflikt: Die Aufgabe, die als zweite ankommt, findet fremde Änderungen in ihren Dateien. orc schickt den Konflikt an die Sitzung zurück, die den Code geschrieben hat; sie löst ihn inhaltlich, besteht die Prüfung erneut und kehrt in die Merge-Warteschlange zurück. Nach drei Versuchen — das Badge „Konflikt“.",
-          s2: "Eine fehlgeschlagene Aufgabe ist rot, und der Grund steht in der Karte. „Erneut versuchen“ beginnt von vorn; „Sitzung fortsetzen“ setzt dieselbe Sitzung fort.",
+          s2: "Eine fehlgeschlagene Aufgabe ist rot, der Grund steht in ihrer Konversation. «Fortsetzen» setzt dieselbe Sitzung fort, mit deiner Nachricht, wenn du eine schreibst; «Erneut versuchen» beginnt von vorn; «Arbeit annehmen» schickt das Ergebnis der Sitzung in die Prüfung.",
           s3: "Kontingent: Ist das Claude-Limit aufgebraucht, wartet die Aufgabe mit dem Badge „Kontingent“, und der Dispatcher setzt sie nach dem Reset fort.",
           s4: "„nicht vertraut“: Claude Code startet keine Sitzungen in einem Ordner, dem du nicht vertraut hast. „Ordner vertrauen und starten“ behebt das einmal pro Projekt.",
           s5: "„unsaubere Kopie“: Im Ziel-Branch hängt ein unvollendeter Merge, Rebase oder Cherry-Pick. orc fasst ihn nicht an — schließ die Operation ab, und die Aufgabe läuft weiter.",
@@ -361,7 +376,7 @@ export const pagesDe: PagesDictionary = {
         c1: "Ein Platz ist frei — die Aufgabe wird aus der Warteschlange genommen.",
         c2: "Für sie werden ein eigener Worktree und Branch erstellt.",
         c3: "`claude --bg` startet mit deinem Auftrag.",
-        c4: "Die Sitzung endet und schreibt ihren Bericht.",
+        c4: "Die Sitzung ruft `orc task done` auf und beendet ihren Zug.",
         c5: "`verify_cmd` läuft im Worktree der Aufgabe.",
         c6: "Merge in den Basis-Branch, eine Aufgabe nach der anderen.",
       },
@@ -375,8 +390,8 @@ export const pagesDe: PagesDictionary = {
       captions: {
         c1: "Der Agent arbeitet.",
         c2: "Er hat eine Frage: Die Karte wird magenta und rückt nach oben.",
-        c3: "Du öffnest die Karte und siehst die Frage.",
-        c4: "Du antwortest in „Antwort an Claude“.",
+        c3: "Du öffnest die Karte: die Frage ist ihre letzte Nachricht.",
+        c4: "Du antwortest im Eingabefeld direkt darunter.",
         c5: "Die Antwort erreicht dieselbe Sitzung, und die Arbeit geht weiter.",
       },
     },

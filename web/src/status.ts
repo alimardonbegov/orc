@@ -6,6 +6,7 @@ import {
   Hand,
   Inbox,
   Loader,
+  Moon,
   ShieldCheck,
   XCircle,
   type LucideIcon,
@@ -120,6 +121,13 @@ export const BLOCKER_META: Record<NonNullable<Blocker>, { icon: LucideIcon; fg: 
     chip: "bg-[color-mix(in_oklab,var(--warn)_16%,transparent)] text-[var(--warn)]",
     dot: "bg-[var(--warn)]",
   },
+  // Asleep until a wakeup the agent asked for: no session and no worker slot, nothing for a human to do yet
+  sleeping: {
+    icon: Moon,
+    fg: "text-[var(--ink-muted)]",
+    chip: "bg-[var(--sunken)] text-[var(--ink-muted)]",
+    dot: "bg-[var(--ink-faint)]",
+  },
 };
 
 /**
@@ -138,7 +146,7 @@ export const OUTBOX_TONE: Record<NonNullable<Task["outbox_state"]>, string> = {
 /**
  * A task "needs attention" if it will not move on without a human:
  * failed, waiting for an answer, or ran into a conflict / dirty worktree.
- * Quota is not about a human: the dispatcher will return to it itself on a timer.
+ * Quota and sleep are not about a human: the dispatcher returns to them itself.
  */
 /**
  * Whether the task has a statement. Only the description goes into the agent prompt (orc/prompt.py),
@@ -149,7 +157,28 @@ export function hasDescription(task: Pick<Task, "description">): boolean {
   return task.description.trim() !== "";
 }
 
+/** The agent (or the dispatcher on its behalf) is busy with the card right now: work, check or merge.
+ * A sleeping card is in progress but has no session until its wakeup. */
+export function isRunning(task: Task): boolean {
+  return (task.status === "in_progress" && task.blocker !== "sleeping") || task.status === "verifying" || task.status === "merging";
+}
+
+/** In work on the board, but asleep until a wakeup: no session, so not "running", yet not idle either. */
+export function isAsleep(task: Task): boolean {
+  return task.status === "in_progress" && task.blocker === "sleeping";
+}
+
+/** A card waiting for a human decision. A failed card is deliberately not here: it already sits in
+ * the Done column with a red status, and repeating it in the attention strip only nagged. */
 export function needsAttention(task: Task): boolean {
-  if (task.status === "failed") return true;
-  return task.blocker !== null && task.blocker !== "quota";
+  if (task.status === "failed") return false;
+  return task.blocker !== null && task.blocker !== "quota" && task.blocker !== "sleeping";
+}
+
+/** What keeps a card out of work: nobody to run it, or nothing to tell them. The server refuses the same.
+ * A routine's run needs no agent: it carries the routine's own parameters. */
+export type WorkIssue = "assignee" | "description";
+
+export function workIssues(task: Pick<Task, "agent_id" | "description" | "routine_id">): WorkIssue[] {
+  return [...(task.agent_id || task.routine_id ? [] : (["assignee"] as const)), ...(hasDescription(task) ? [] : (["description"] as const))];
 }

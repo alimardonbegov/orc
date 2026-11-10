@@ -27,7 +27,7 @@ const project = (id: number, name: string): Project => ({
 
 const task = (id: number, projectId: number, title: string): Task => ({
   id, project_id: projectId, title, description: "", status: "todo", priority: "normal", blocker: null,
-  blocker_detail: null, target_branch: "main", model: null, effort: null, permission_mode: null, verify_cmd: null,
+  blocker_detail: null, target_branch: "main", verify_cmd: null,
   requires_review: 0, worktree_path: null, branch: null, job_id: null, session_id: null, auto_resume_count: 0,
   state_miss_count: 0, quota_retry_count: 0, conflict_retry_count: 0, resume_with: null, outbox_state: null,
   merge_queued_at: null, retry_after: null,
@@ -42,7 +42,9 @@ function mockBackend(tasks: Task[] = [], projectsOver: Partial<Project>[] = []) 
   ];
   (fetch as unknown as ReturnType<typeof vi.fn>).mockImplementation((url: string) => {
     const ok = (body: unknown) => Promise.resolve({ ok: true, status: 200, json: async () => body });
+    if (/^\/api\/projects\/\d+\/views/.test(url)) return ok([]);
     if (url.startsWith("/api/projects")) return ok(projects);
+    if (/^\/api\/tasks\/\d+\/runs/.test(url)) return ok({ runs: [], checks: [], merges: [], totals: { cost_usd: 0, tokens: 0, agent_sec: 0 } });
     if (url.startsWith("/api/tasks/")) return ok({ ...tasks[0], comments: [] });
     if (url.startsWith("/api/tasks")) return ok(tasks);
     if (url === "/api/dispatcher") return dispatcherOk();
@@ -190,7 +192,7 @@ describe("App", () => {
       render(<App />);
       const dialog = await screen.findByRole("dialog");
       // The title is also on the board card, so look specifically in the dialog.
-      await waitFor(() => expect(within(dialog).getByText("Saved task")).toBeInTheDocument());
+      await waitFor(() => expect(within(dialog).getByDisplayValue("Saved task")).toBeInTheDocument());
     });
 
     it("a collapsed sidebar stays collapsed", async () => {

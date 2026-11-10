@@ -101,3 +101,43 @@ it("the view renders text and images in the original order", () => {
   // The image opens at full size: it is shrunk in the card
   expect(screen.getByRole("link")).toHaveAttribute("href", "/api/attachments/9");
 });
+
+it("the toolbar stands under the field, so it cannot push the text down", () => {
+  render(<Harness initial="text" />);
+  const area = screen.getByRole("textbox", { name: "Task for the agent" });
+  const toolbar = screen.getByRole("radiogroup", { name: /Task for the agent/ });
+  expect(area.compareDocumentPosition(toolbar) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+});
+
+it("opening focuses the field without scrolling to it, with the caret where it was asked to be", () => {
+  const focus = vi.spyOn(HTMLElement.prototype, "focus");
+  render(<DescriptionEditor label="Task" value="hello world" onChange={() => {}} autoFocus initialCaret={5} />);
+  const area = screen.getByRole("textbox", { name: "Task" }) as HTMLTextAreaElement;
+  expect(focus).toHaveBeenCalledWith({ preventScroll: true });
+  expect(area).toHaveFocus();
+  expect([area.selectionStart, area.selectionEnd]).toEqual([5, 5]);
+  focus.mockRestore();
+});
+
+it("without a place for the caret it goes to the end of the text", () => {
+  render(<DescriptionEditor label="Task" value="hello" onChange={() => {}} autoFocus />);
+  const area = screen.getByRole("textbox", { name: "Task" }) as HTMLTextAreaElement;
+  expect(area.selectionStart).toBe(5);
+});
+
+it("a caret past the end of the text is held at the end", () => {
+  render(<DescriptionEditor label="Task" value="hi" onChange={() => {}} autoFocus initialCaret={99} />);
+  expect((screen.getByRole("textbox", { name: "Task" }) as HTMLTextAreaElement).selectionStart).toBe(2);
+});
+
+it("the preview has the box of the field, so switching between them moves nothing", async () => {
+  render(<DescriptionEditor label="Task" value="hello" onChange={() => {}} minHeight={90} />);
+  const area = screen.getByRole("textbox", { name: "Task" });
+  await userEvent.click(screen.getByRole("radio", { name: "Preview" }));
+  const preview = screen.getByText("hello").closest("div[style]")!;
+  for (const cls of ["border", "px-2.5", "py-1.5", "text-[13px]", "leading-relaxed"]) {
+    expect(area).toHaveClass(cls);
+    expect(preview).toHaveClass(cls);
+  }
+  expect(preview).toHaveStyle({ minHeight: "90px" });
+});

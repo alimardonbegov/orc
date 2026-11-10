@@ -10,6 +10,7 @@ import pytest
 
 from orc import git_ops, projects
 from orc.models import TaskStatus
+from tests.fakes import to_work
 
 
 def _move_dir(src, dst):
@@ -32,7 +33,7 @@ def test_path_status_reports_why_folder_is_unusable(tmp_path, git_repo):
 def test_move_relinks_worktrees_and_keeps_them_working(client, repo, dispatcher, fake_cli, git_repo, tmp_path):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     dispatcher.tick()  # the task worktree was created in the old folder
     old_worktree = repo.get_task(t["id"]).worktree_path
     assert old_worktree and str(git_repo) in old_worktree
@@ -56,7 +57,7 @@ def test_move_relinks_worktrees_and_keeps_them_working(client, repo, dispatcher,
 def test_move_is_refused_while_tasks_are_running_in_the_old_folder(client, repo, dispatcher, git_repo, tmp_path):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     dispatcher.tick()
     assert repo.get_task(t["id"]).status == TaskStatus.IN_PROGRESS
     copy = tmp_path / "copy"
@@ -112,7 +113,7 @@ def test_task_creation_is_refused_when_the_folder_is_gone(client, git_repo, tmp_
 def test_archive_hides_project_and_stops_the_dispatcher(client, repo, dispatcher, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
 
     r = client.post("/api/projects/1/archive")
     assert r.status_code == 200 and r.json()["archived_at"]
@@ -133,7 +134,7 @@ def test_archive_hides_project_and_stops_the_dispatcher(client, repo, dispatcher
 def test_archive_is_refused_while_a_task_is_running(client, repo, dispatcher, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     dispatcher.tick()
     r = client.post("/api/projects/1/archive")
     assert r.status_code == 400 and f"#{t['id']}" in r.json()["detail"]
