@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import re
 import sqlite3
 from pathlib import Path
 from typing import Callable
@@ -125,11 +126,41 @@ CREATE TABLE IF NOT EXISTS input_requests (
   answered_at TEXT
 );
 
+-- One row per verification run (orc/dispatcher.py, _apply_verify_outcome): the card's execution log shows it to the
+-- owner. Before, a failed check's output reached only the agent. output_tail is capped (orc/runs.py, OUTPUT_TAIL).
+CREATE TABLE IF NOT EXISTS task_checks (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  job_id TEXT,                 -- the session whose work was checked
+  cmd TEXT NOT NULL,
+  ok INTEGER NOT NULL,
+  duration_sec REAL NOT NULL DEFAULT 0,
+  output_tail TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL
+);
+
+-- Wakeups a task session asked for (orc/wakeups.py): resume me at a time, or when another card is done. While a
+-- card sleeps it has no live session and holds no worker slot. watch_task_id has no foreign key: a deleted card is
+-- itself a reason to wake.
+CREATE TABLE IF NOT EXISTS task_wakeups (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  kind TEXT NOT NULL,                      -- at | task
+  wake_at TEXT,                            -- ISO UTC: the time, or the deadline of a task wakeup; NULL means none
+  watch_task_id INTEGER,                   -- the card a task wakeup waits for
+  note TEXT NOT NULL DEFAULT '',           -- what the agent wants to do when it wakes, given back to it
+  state TEXT NOT NULL DEFAULT 'pending',   -- pending | fired | cancelled
+  reason TEXT,                             -- why it fired or was cancelled
+  created_at TEXT NOT NULL,
+  ended_at TEXT
+);
+
 -- Recurring tasks (orc/routines.py): the task statement and schedule. Each run is an ordinary
 -- row in tasks with routine_id, so a run has its own log, report, tokens and status.
 CREATE TABLE IF NOT EXISTS routines (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  -- NULL means a routine outside any project: each run is a chat with its agent (orc/routines.py)
+  project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
   title TEXT NOT NULL,
   description TEXT NOT NULL DEFAULT '',
   priority TEXT NOT NULL DEFAULT 'normal',
@@ -153,6 +184,81 @@ CREATE TABLE IF NOT EXISTS routines (
   updated_at TEXT NOT NULL
 );
 
+-- A pre-configured executor (orc/agents.py): run parameters plus an optional prompt. A task or a
+-- routine points at one instead of carrying its own parameters. NULL project_id means available
+-- everywhere; otherwise the agent is internal to that project. Empty run parameters are inherited
+-- from the project, the same way a task inherits them.
+CREATE TABLE IF NOT EXISTS agents (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE,
+  description TEXT NOT NULL DEFAULT '',
+  avatar TEXT,                     -- a small data:image URL or a short glyph; NULL means initials
+  model TEXT,
+  effort TEXT,
+  permission_mode TEXT,
+  prompt TEXT NOT NULL DEFAULT '',
+  project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  memory_enabled INTEGER NOT NULL DEFAULT 0,  -- 1: the agent's own memory directory (orc/agents.py)
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+-- A direct conversation with an agent (orc/chats.py): one Claude Code session in its own folder.
+-- It lives apart from tasks: it has no board status, no verification and no merge.
+CREATE TABLE IF NOT EXISTS chats (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  agent_id INTEGER NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+  project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,
+  title TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'idle',     -- idle | queued | running | waiting
+  cwd TEXT,
+  branch TEXT,
+  job_id TEXT,
+  session_id TEXT,
+  transcript_path TEXT,
+  transcript_offset INTEGER NOT NULL DEFAULT 0,  -- bytes of the transcript already turned into messages
+  turn_started_at TEXT,
+  turn_progress INTEGER NOT NULL DEFAULT 0,      -- the current turn has written something to the transcript
+  waiting_detail TEXT,
+  usage_json TEXT,
+  last_read_message_id INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS chat_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  chat_id INTEGER NOT NULL REFERENCES chats(id) ON DELETE CASCADE,
+  role TEXT NOT NULL,                      -- user | assistant | activity | system | proposal
+  body TEXT NOT NULL,
+  -- user: queued | sent | failed | cancelled; proposal: open | accepted | dismissed; otherwise NULL
+  state TEXT,
+  created_at TEXT NOT NULL
+);
+
+-- Labels (orc/labels.py): global across projects, the name is unique ignoring case.
+CREATE TABLE IF NOT EXISTS labels (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  color TEXT NOT NULL DEFAULT '#8b8b95'
+);
+
+CREATE TABLE IF NOT EXISTS task_labels (
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  label_id INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+  PRIMARY KEY (task_id, label_id)
+);
+
+-- Saved board views (orc/board_views.py): a named set of board filters, per project.
+CREATE TABLE IF NOT EXISTS board_views (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  name TEXT NOT NULL COLLATE NOCASE,
+  filters_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (project_id, name)
+);
+
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -168,6 +274,20 @@ CREATE TABLE IF NOT EXISTS attachments (
   size INTEGER NOT NULL,
   rel_path TEXT NOT NULL,      -- file name inside <data_dir>/attachments
   created_at TEXT NOT NULL
+);
+
+-- Files an agent hands in as the result of a card (orc/deliverables.py). The bytes live in the attachment store,
+-- so they outlive the working copy. Handing in a name again makes the next version; the card going away takes
+-- the rows with it, the stored file stays, as for any attachment.
+CREATE TABLE IF NOT EXISTS deliverables (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL,
+  attachment_id INTEGER NOT NULL REFERENCES attachments(id),
+  sha256 TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  UNIQUE (task_id, name, version)
 );
 
 -- Spending log over time: every recount of a task's tokens (orc/dispatcher.py,
@@ -210,6 +330,13 @@ CREATE INDEX IF NOT EXISTS idx_input_requests_task_state ON input_requests (task
 CREATE INDEX IF NOT EXISTS idx_usage_ledger_at ON usage_ledger (at);
 CREATE INDEX IF NOT EXISTS idx_limit_samples_window ON limit_samples (limit_window, measured_at);
 CREATE INDEX IF NOT EXISTS idx_tasks_routine ON tasks (routine_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_agent ON tasks (agent_id);
+CREATE INDEX IF NOT EXISTS idx_chat_messages_chat ON chat_messages (chat_id, id);
+CREATE INDEX IF NOT EXISTS idx_chats_status ON chats (status);
+CREATE INDEX IF NOT EXISTS idx_task_checks_task ON task_checks (task_id);
+CREATE INDEX IF NOT EXISTS idx_task_labels_label ON task_labels (label_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks (parent_task_id);
+CREATE INDEX IF NOT EXISTS idx_task_wakeups_state ON task_wakeups (state, task_id);
 """
 
 
@@ -232,6 +359,12 @@ ADD_COLUMNS: dict[str, dict[str, str]] = {
         # Result viewing (orc/viewing.py): a project's finished tasks wait for the owner's look.
         # On by default; 0 means a project without marks and unviewed counters.
         "track_viewed": "INTEGER NOT NULL DEFAULT 1",
+        # The project's lead (orc/agents.py): an agent that sees the board in its chats and may
+        # propose tasks. It does not change anyone's run parameters. NULL means no lead.
+        "lead_agent_id": "INTEGER",
+        # What this project's cards show and start with (orc/card_settings.py): a JSON object.
+        # NULL means nothing of its own, the settings.card_settings of orc apply.
+        "card_settings": "TEXT",
     },
     "tasks": {
         "state_miss_count": "INTEGER NOT NULL DEFAULT 0",
@@ -263,6 +396,72 @@ ADD_COLUMNS: dict[str, dict[str, str]] = {
         # will not add one, and deleting a routine already nulls the reference (Repo.delete_routine).
         "routine_id": "INTEGER",
         "routine_run": "INTEGER",
+        # The agent the task is allocated to (orc/agents.py). No foreign key for the same reason as
+        # routine_id: Repo.delete_agent nulls the reference. NULL means the project's parameters.
+        "agent_id": "INTEGER",
+        # Who created the card (orc/task_plans.py). No foreign key for the same reason as routine_id,
+        # and a dangling id is harmless: it only ends the walk that counts generations.
+        "created_by_task_id": "INTEGER",
+        # Idempotency key of a batch (orc/api/task_plans.py). NULL means no deduplication was asked for.
+        "batch_key": "TEXT",
+        # The session's signal that the work is handed in (orc/handoff.py): when, in epoch seconds so that it
+        # compares with the start of a turn, and what it said: done | failed. NULL means no signal.
+        "handoff_at": "REAL",
+        "handoff_status": "TEXT",
+        # Planning dates, YYYY-MM-DD (orc/labels.py). The dispatcher never reads them; start_after is the
+        # deferred start that holds the queue. NULL means no date.
+        "start_date": "TEXT",
+        "due_date": "TEXT",
+        # The card this one is a subtask of (web/src/relations.ts): grouping for decomposition, with no effect on the
+        # queue. Not created_by_task_id, which the generation fuse walks: a person's subtask must not eat that budget.
+        # No foreign key for the same reason as routine_id; Repo.delete_task nulls the children's reference.
+        "parent_task_id": "INTEGER",
+        # Waking the parent when its subtasks are done (orc/child_wake.py). wake_on_children: 1 wakes, 0 never,
+        # NULL follows the project's and orc's card settings (off unless they say otherwise). children_wake_key is the
+        # fingerprint of the subtasks the last wake (or the baseline taken when the setting was turned on) covered, so
+        # the same finished set never wakes twice; children_wake_count caps the wakes of one card.
+        "wake_on_children": "INTEGER",
+        "children_wake_key": "TEXT",
+        "children_wake_count": "INTEGER NOT NULL DEFAULT 0",
+        # Why the pending resume (resume_with) was queued, as a run trigger (sessions.TRIGGERS). NULL means rework.
+        "resume_trigger": "TEXT",
+        # The stage among the subtasks of one parent (orc/stages.py); the blockers are derived, not stored
+        "stage": "INTEGER",
+        # The code of the reason in blocker_detail (orc/failures.py); NULL means the text stands alone
+        "detail_code": "TEXT",
+    },
+    "task_sessions": {
+        # The execution log (orc/runs.py): why the run started (sessions.TRIGGERS), when and how it ended
+        # (sessions.OUTCOMES), and on behalf of which agent. NULL in rows written before the log existed: the card
+        # labels them "Run" and derives their end from the next run.
+        "trigger": "TEXT",
+        "ended_at": "TEXT",
+        "outcome": "TEXT",
+        "agent_id": "INTEGER",
+        # What exactly started the run, when the trigger alone does not say: for `wakeup`, which condition held.
+        "trigger_detail": "TEXT",
+    },
+    "task_checks": {
+        # How the check ended (orc/verify.py): the process exit code, and whether the timeout killed it.
+        # NULL in rows written before the log kept it: the card then shows nothing about the code.
+        "exit_code": "INTEGER",
+        "timed_out": "INTEGER",
+    },
+    "routines": {
+        # The agent each run is allocated to: copied into the run's task.
+        "agent_id": "INTEGER",
+    },
+    "chats": {
+        # A run of a routine outside any project (orc/routines.py): whose chat this is and which run
+        # by count. No foreign key for the same reason as tasks.routine_id; Repo.delete_routine nulls it.
+        "routine_id": "INTEGER",
+        "routine_run": "INTEGER",
+        # List organisation chosen by the owner: a pinned chat stays on top, an archived one leaves the
+        # default list (orc/api/chats.py). Neither touches the conversation itself.
+        "pinned": "INTEGER NOT NULL DEFAULT 0",
+        "archived_at": "TEXT",
+        # The chat's secret for its input-request hook (orc/inputs.py). NULL means none issued yet.
+        "hook_secret": "TEXT",
     },
 }
 
@@ -334,11 +533,79 @@ def _seed_viewed(conn: sqlite3.Connection) -> None:
                  (now_iso(), viewing.grace_cutoff(utc_now())))
 
 
+def _routines_project_nullable(conn: sqlite3.Connection) -> None:
+    """Routines outside a project appeared later: routines.project_id must accept NULL. SQLite cannot drop
+    NOT NULL with ALTER TABLE, so the table is rebuilt. A database created from the current SCHEMA already
+    has the nullable column and is left alone."""
+    info = {row["name"]: row for row in conn.execute("PRAGMA table_info(routines)")}
+    if not info or not info["project_id"]["notnull"]:
+        return
+    columns = ", ".join(info)
+    # The plain recipe: the new table is created from the current SCHEMA text, rows are copied by name.
+    # Nothing references routines by a foreign key (tasks.routine_id deliberately has none).
+    conn.execute("ALTER TABLE routines RENAME TO routines_old")
+    match = re.search(r"CREATE TABLE IF NOT EXISTS routines \(.*?\n\);", SCHEMA, re.DOTALL)
+    conn.execute(match.group(0).replace("IF NOT EXISTS ", ""))
+    # agent_id was added by ALTER, so a table made from the new SCHEMA text does not have it yet
+    for name, declaration in ADD_COLUMNS["routines"].items():
+        conn.execute(f"ALTER TABLE routines ADD COLUMN {name} {declaration}")
+    conn.execute(f"INSERT INTO routines ({columns}) SELECT {columns} FROM routines_old")
+    conn.execute("DROP TABLE routines_old")
+
+
+# The block every prompt template carried while report.json told orc that work was handed in. A literal on
+# purpose: it describes what is stored in old databases, whatever the default template says today.
+_OLD_REPORT_BLOCK = """- As your last action, write the file {report_path} in JSON format:
+  {{"status": "success" | "failed" | "needs_input", "summary": "what was done in 2-3 sentences", "notes": "what failed or what to pay attention to"}}
+  Write summary and notes in the same language as the task description.
+  Use status=failed if the task could not be completed. Do not write success if the tests fail.
+  Use status=needs_input if you stopped for the owner's answer, decision or check, and put the question in your final message. status=success hands the work in: it goes to verification and merge right away, and nobody reads your questions first.
+"""
+
+
+def _template_without_report(conn: sqlite3.Connection) -> None:
+    """An edited prompt template still orders the report that `orc task done` replaced. The block goes only on an
+    exact match, with the old text kept beside it. A template that mentions the report in other words
+    is the owner's own writing: it stays as it is, and the settings dialog warns about it."""
+    from orc.util import now_iso
+
+    row = conn.execute("SELECT value FROM settings WHERE key = 'prompt_template'").fetchone()
+    if row is None or _OLD_REPORT_BLOCK not in row["value"]:
+        return
+    conn.execute("INSERT INTO settings (key, value) VALUES ('prompt_template_before_handoff', ?) "
+                 "ON CONFLICT(key) DO NOTHING", (row["value"],))
+    conn.execute("UPDATE settings SET value = ? WHERE key = 'prompt_template'",
+                 (row["value"].replace(_OLD_REPORT_BLOCK, ""),))
+    conn.execute("INSERT INTO events (level, message, created_at) VALUES ('info', ?, ?)",
+                 ("The report block was removed from the prompt template: sessions hand in with `orc task done` now. "
+                  "The old text is kept in the setting prompt_template_before_handoff.", now_iso()))
+
+
+def _parents_from_creators(conn: sqlite3.Connection) -> None:
+    """Subtasks appeared after cards created by agents: a card made by a session was its subtask all along. A dangling
+    creator is skipped, it names no card to group under. Runs once, so a later card made with --no-parent stays apart."""
+    conn.execute("UPDATE tasks SET parent_task_id = created_by_task_id "
+                 "WHERE parent_task_id IS NULL AND created_by_task_id IN (SELECT id FROM tasks)")
+
+
+def _drop_card_run_parameters(conn: sqlite3.Connection) -> None:
+    """A card is tied to its agent and holds no model, effort or permission mode of its own. The columns stay
+    (SQLite cannot drop them cheaply and an older build still reads them) but nothing reads or writes them
+    any more, so stored values are cleared rather than left to look like a setting that does nothing."""
+    for table in ("tasks", "routines"):
+        have = {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+        cols = [c for c in ("model", "effort", "permission_mode") if c in have]
+        if cols:
+            conn.execute(f"UPDATE {table} SET " + ", ".join(f"{c} = NULL" for c in cols))
+
+
 # Migrations that cannot be expressed via ADD_COLUMNS: renaming a column, changing a type,
 # filling new fields from old ones. Each is a function that changes the connection;
 # the order in the list is the order of application. The migration with index i (from one) raises
 # the database to version i + 1.
-MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_seed_usage_ledger, _seed_viewed]
+MIGRATIONS: list[Callable[[sqlite3.Connection], None]] = [_seed_usage_ledger, _seed_viewed, _routines_project_nullable,
+                                                         _template_without_report, _parents_from_creators,
+                                                         _drop_card_run_parameters]
 
 # The schema version that THIS code understands. Grows together with MIGRATIONS.
 SCHEMA_VERSION = 1 + len(MIGRATIONS)

@@ -34,10 +34,15 @@ def get_attachment(attachment_id: int, request: Request):
     row = store.get(attachment_id)
     if row is None:
         raise HTTPException(404, "attachment not found")
+    # Only the images pasted into task text come out here. Handed-in files (orc/deliverables.py) share the store
+    # but are served by their own endpoint, with the headers that keep them from running.
+    if row["mime"] not in MIME_EXT:
+        raise HTTPException(404, "attachment not found")
     path = store.path(row)
     if not path.exists():
         raise HTTPException(404, "attachment file is missing from disk")
-    return FileResponse(path, media_type=row["mime"], filename=row["filename"])
+    return FileResponse(path, media_type=row["mime"], filename=row["filename"],
+                        headers={"X-Content-Type-Options": "nosniff"})
 
 
 @router.get("/attachments-limits")

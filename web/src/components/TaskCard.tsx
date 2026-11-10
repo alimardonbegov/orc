@@ -1,12 +1,20 @@
 import { useDraggable } from "@dnd-kit/core";
 import { useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { Archive, Check, Clock, Coins, GitBranch, Repeat, Send } from "lucide-react";
+import { Archive, CalendarCheck, Check, Clock, Coins, GitBranch, Repeat, Send } from "lucide-react";
 import type { Task } from "../types";
 import { blockerLabel, outboxLabel, priorityLabel, stageLabel, statusLabel, waitingLabel } from "../labels";
 import { BLOCKER_META, OUTBOX_TONE, STATUS_META } from "../status";
 import { formatTokens, parseUsage, usageTitle } from "../usage";
 import { Badge } from "../ui/Badge";
+import { useAgents } from "../agents";
+import { AgentAvatar } from "./AgentAvatar";
+import { ProgressPill } from "./RelationsSection";
+import { useSubtaskProgress } from "../subtaskProgress";
+import { LabelChip } from "./LabelChip";
+import { formatDay, isOverdue, todayKey } from "../planDates";
+import { PriorityIcon } from "./cardProperties/PriorityProperty";
+import { PRIORITY_META } from "../priority";
 import { cn } from "../lib/cn";
 import { focusRing } from "../ui/tokens";
 import { useTranslation } from "../i18n";
@@ -25,6 +33,44 @@ interface Props {
   /** Result viewing (viewing.ts). Not set means the card does not take part: the project does not
    * track viewing, the task is not finished or is archived. */
   viewing?: { viewed: boolean; onToggle: (viewed: boolean) => void };
+  /** Selection for bulk actions. Not set means the card cannot be selected (the drag layer). `any` is true while
+   * something is selected: then the mark stays visible and a click on the card selects it instead of opening it. */
+  selection?: { selected: boolean; any: boolean; onToggle: () => void };
+}
+
+/**
+ * The selection box in the corner of a card. Like the viewed mark it sits inside a card that opens on click and
+ * is dragged by the mouse, so it swallows the pointer, the click and the keys: pressing it neither opens the
+ * card nor starts a drag.
+ */
+function SelectMark({ id, selected, visible, onToggle }: { id: number; selected: boolean; visible: boolean; onToggle: () => void }) {
+  const { t } = useTranslation();
+  return (
+    <button
+      type="button"
+      role="checkbox"
+      aria-checked={selected}
+      aria-label={t("bulk.selectCard", { id })}
+      data-select-mark
+      onPointerDown={(e) => e.stopPropagation()}
+      onKeyDown={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        onToggle();
+      }}
+      className={cn(
+        "-ml-1 flex h-4 w-4 shrink-0 cursor-pointer items-center justify-center rounded-[4px] border transition-opacity duration-100",
+        "focus-visible:opacity-100 group-hover:opacity-100",
+        visible || selected ? "opacity-100" : "opacity-0",
+        selected
+          ? "border-transparent bg-[var(--primary)] text-[var(--primary-ink)]"
+          : "border-[var(--line-strong)] bg-[var(--surface)] text-transparent hover:border-[var(--ink-muted)]",
+        focusRing,
+      )}
+    >
+      <Check size={11} strokeWidth={3} aria-hidden />
+    </button>
+  );
 }
 
 /**
@@ -76,8 +122,10 @@ function ViewedMark({ viewed, onToggle, inert }: { viewed: boolean; onToggle: (v
  * across columns. The strip's shape is the same everywhere, so the eye looks for colour instead of
  * rereading labels.
  */
-export function TaskCard({ task, onOpen, overlay, sortable, viewing }: Props) {
+export function TaskCard({ task, onOpen, overlay, sortable, viewing, selection }: Props) {
   const { t, language } = useTranslation();
+  const agent = useAgents().find((a) => a.id === task.agent_id);
+  const subtasks = useSubtaskProgress(task.id);
   const now = useNow();
   // An archived card is not dragged: the dispatcher does not move it, and a "move" would mean
   // nothing.
@@ -139,14 +187,17 @@ export function TaskCard({ task, onOpen, overlay, sortable, viewing }: Props) {
       {...(overlay ? {} : attributes)}
       role="button"
       tabIndex={0}
-      onClick={overlay ? undefined : () => onOpen(task.id)}
+      aria-selected={selection?.selected}
+      // While something is selected, a click on a card joins the selection instead of opening the card
+      onClick={overlay ? undefined : () => (selection?.any ? selection.onToggle() : onOpen(task.id))}
       onKeyDown={
         overlay
           ? undefined
           : (e) => {
               if (e.key === "Enter" || e.key === " ") {
                 e.preventDefault();
-                onOpen(task.id);
+                if (selection?.any) selection.onToggle();
+                else onOpen(task.id);
               }
             }
       }
@@ -165,11 +216,15 @@ export function TaskCard({ task, onOpen, overlay, sortable, viewing }: Props) {
             : "cursor-grab hover:border-[var(--line-strong)]",
         // The source spot stays as an empty frame: you can see where the strip was taken from.
         isDragging && !overlay && "opacity-30",
+        selection?.selected && "border-[var(--focus)] bg-[color-mix(in_oklab,var(--focus)_7%,var(--surface))]",
       )}
     >
       <span aria-hidden className={cn("absolute inset-y-0 left-0 w-[3px]", railTone)} />
 
       <div className="mb-1 flex items-center gap-2">
+        {selection && !overlay && (
+          <SelectMark id={task.id} selected={selection.selected} visible={selection.any} onToggle={selection.onToggle} />
+        )}
         <span className="tnum shrink-0 font-mono text-[11px] text-[var(--ink-faint)]">#{task.id}</span>
         {moment && (
           <span
@@ -180,12 +235,8 @@ export function TaskCard({ task, onOpen, overlay, sortable, viewing }: Props) {
           </span>
         )}
         {task.priority !== "normal" && (
-          <span
-            className={cn(
-              "text-[11px] font-medium",
-              task.priority === "high" ? "text-[var(--danger)]" : "text-[var(--ink-faint)]",
-            )}
-          >
+          <span className={cn("flex shrink-0 items-center gap-0.5 text-[11px] font-medium", PRIORITY_META[task.priority].fg)}>
+            <PriorityIcon priority={task.priority} size={12} />
             {priorityLabel(t, task.priority)}
           </span>
         )}
@@ -229,8 +280,18 @@ export function TaskCard({ task, onOpen, overlay, sortable, viewing }: Props) {
         task.outbox_state ||
         tokens ||
         task.routine_run ||
-        task.depends_on.length > 0) && (
-        <div className="mt-1.5 flex flex-wrap gap-1">
+        task.depends_on.length > 0 ||
+        subtasks ||
+        task.due_date ||
+        task.labels?.length ||
+        agent) && (
+        <div className="mt-1.5 flex flex-wrap items-center gap-1">
+          {agent && (
+            <span className="flex items-center gap-1 text-[11px] text-[var(--ink-muted)]" title={agent.description || agent.name}>
+              <AgentAvatar agent={agent} size={16} />
+              <span className="max-w-24 truncate">{agent.name}</span>
+            </span>
+          )}
           {/* Run of a recurring task: the run number, while the routine itself is in the
              "Routines" tab. */}
           {task.routine_run ? (
@@ -283,6 +344,19 @@ export function TaskCard({ task, onOpen, overlay, sortable, viewing }: Props) {
               {t("taskCard.dependsOn", { id: d })}
             </Badge>
           ))}
+          {/* A parent: how far its subtasks are, next to what it waits for */}
+          {subtasks && <ProgressPill {...subtasks} />}
+          {task.due_date && (
+            <Badge
+              icon={CalendarCheck}
+              tone={isOverdue(task.due_date, task.status, todayKey(now)) ? "bg-[color-mix(in_oklab,var(--danger)_14%,transparent)] text-[var(--danger)]" : undefined}
+              title={isOverdue(task.due_date, task.status, todayKey(now)) ? t("card.dueDate.overdue") : t("card.dueDate.label")}
+              className="tnum"
+            >
+              {formatDay(task.due_date, language, now)}
+            </Badge>
+          )}
+          {task.labels?.map((l) => <LabelChip key={l.id} label={l} className="max-w-28" />)}
           {tokens && (
             <Badge icon={Coins} mono title={usageTitle(t, tokens)} className="tnum">
               {formatTokens(tokens.total_tokens)}

@@ -1,19 +1,13 @@
 import { modelLabel } from "./models";
 import { permissionLabel } from "./permissions";
 import type { TFunction } from "./i18n";
-import type { PermissionMode, Project } from "./types";
+import type { Agent, Project } from "./types";
 
 /**
- * A task's run parameters are inherited from the project: an empty field is not "nothing",
- * but a concrete project setting (see dispatcher.py: `task.model or project.default_model`).
- *
- * The label "project default" did not show this: to find out which model
- * the task would run on, you had to open the project settings. So the empty option
- * shows the value itself, and the suffix explains where it came from.
- *
- * The value is not put into the field: the task stays null and keeps
- * following the project setting if it changes. Writing the value into the task
- * silently detaches it from the project, and it looks the same.
+ * Run parameters belong to the agent, not to the card: an empty field of an agent is not "nothing",
+ * but a concrete project setting (see orc/agents.py: `agent value or project default`). The empty option
+ * shows that value, and the suffix explains where it came from. The value is not written into the agent,
+ * so it keeps following the project setting if it changes.
  */
 
 /**
@@ -43,34 +37,22 @@ function inherited(t: TFunction, value: string | null, known: boolean): string {
  * field would bloat the block exactly when the person has chosen nothing.
  * The pickers show the explanation of the value themselves — when it was chosen by hand.
  */
-export const inheritedModel = (t: TFunction, project?: Project | null): string =>
-  inherited(t, project?.default_model ? modelLabel(project.default_model) : null, !!project);
+export const inheritedModel = (t: TFunction, project?: Project | null, agent?: Agent | null): string =>
+  agent?.model
+    ? t("runParams.valueFromAgent", { value: modelLabel(agent.model) })
+    : inherited(t, project?.default_model ? modelLabel(project.default_model) : null, !!project);
 
-export const inheritedEffort = (t: TFunction, project?: Project | null): string =>
-  inherited(t, project?.default_effort ?? null, !!project);
+export const inheritedEffort = (t: TFunction, project?: Project | null, agent?: Agent | null): string =>
+  agent?.effort ? t("runParams.valueFromAgent", { value: agent.effort }) : inherited(t, project?.default_effort ?? null, !!project);
 
 /** For the permission mode the project default is always set, there is no "as Claude Code decides" option. */
-export const inheritedPermission = (t: TFunction, project?: Project | null): string =>
-  project ? t("runParams.valueFromProject", { value: permissionLabel(project.default_permission_mode) }) : t("runParams.fromProject");
+export const inheritedPermission = (t: TFunction, project?: Project | null, agent?: Agent | null): string => {
+  if (agent?.permission_mode) return t("runParams.valueFromAgent", { value: permissionLabel(agent.permission_mode) });
+  return project ? t("runParams.valueFromProject", { value: permissionLabel(project.default_permission_mode) }) : t("runParams.fromProject");
+};
 
 /** The verify command is a free-form string, so we show it as a placeholder. */
 export const inheritedVerifyCmd = (t: TFunction, project?: Project | null): string => {
   if (!project) return t("runParams.fromProject");
   return project.verify_cmd ? t("runParams.valueFromProject", { value: project.verify_cmd }) : t("runParams.verifyNotSet");
 };
-
-interface TaskParams {
-  model: string | null;
-  effort: string | null;
-  permission_mode: PermissionMode | null;
-  verify_cmd: string | null;
-}
-
-/**
- * Whether the task has its own values instead of the project's. By this flag the block
- * shows "Restore project values": it is easy to accumulate overrides, but there is no other way to return a
- * field to inheritance — the empty option in the list is easy to miss.
- */
-export function hasOwnRunParams(v: TaskParams): boolean {
-  return v.model !== null || v.effort !== null || v.permission_mode !== null || v.verify_cmd !== null;
-}

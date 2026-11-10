@@ -52,6 +52,7 @@ PRICING_VERSION = "2026-11-01"
 # Haiku 5.5 is the price for requests up to 100K tokens (above that $0.50/$2.50): the per-model
 # breakdown stores sums, not the size of each request, so long Haiku requests are slightly underestimated.
 MODEL_PRICES_PER_MTOK: dict[str, tuple[float, float, float]] = {
+    "claude-fable-5-2": (10.0, 50.0, 0.25),
     "claude-fable-5-1": (10.0, 50.0, 0.25),
     "claude-mythos-5-1": (10.0, 50.0, 0.25),
     "claude-fable-5": (10.0, 50.0, 1.0),

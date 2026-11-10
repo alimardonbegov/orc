@@ -6,9 +6,9 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, Field
 
-from orc import claude_md, projects, viewing
-from orc.api.common import (PROJECT_ARCHIVED_FILTERS, _check_branch_exists, _check_mode, _project_or_404, _project_out,
-                            _repo, hidden_models_json)
+from orc import card_settings, child_wake, claude_md, projects, viewing
+from orc.api.common import (PROJECT_ARCHIVED_FILTERS, _check_agent, _check_branch_exists, _check_mode, _project_or_404, _project_out,
+                            _repo, check_card_settings, hidden_models_json)
 from orc.util import utc_now
 
 router = APIRouter()
@@ -51,6 +51,10 @@ class ProjectPatch(BaseModel):
     # Manual order in the sidebar (drag, see web/src/components/Sidebar.tsx). The value is entirely
     # up to the client: the server does not interpret it, only stores it (like a task's position).
     position: int | None = None
+    # The project's lead (orc/agents.py); null means no lead
+    lead_agent_id: int | None = None
+    # What this project's cards show and start with (orc/card_settings.py); null means as in orc
+    card_settings: dict | None = None
 
 
 class ProjectPathIn(BaseModel):
@@ -127,6 +131,10 @@ def patch_project(project_id: int, body: ProjectPatch, request: Request):
         raise HTTPException(404, "project not found")
     if fields.get("default_branch"):
         _check_branch_exists(project.path, fields["default_branch"])
+    if "lead_agent_id" in fields:
+        _check_agent(_repo(request), fields["lead_agent_id"], project_id)
+    if fields.get("card_settings") is not None:
+        fields["card_settings"] = card_settings.dumps(check_card_settings(_repo(request), fields["card_settings"], project_id))
     if "track_viewed" in fields:
         if fields["track_viewed"] is None:
             raise HTTPException(400, "track_viewed: true or false expected")
@@ -135,7 +143,11 @@ def patch_project(project_id: int, body: ProjectPatch, request: Request):
             # While viewing was off, nobody set marks: without this, turning it on
             # would dump the whole "Done" archive as unviewed. Fresh ones stay as they are.
             _repo(request).mark_all_viewed(project_id, before=viewing.grace_cutoff(utc_now()))
-    return _project_out(_repo(request).update_project(project_id, **fields))
+    wake_before = child_wake.enabled_parents(_repo(request)) if "card_settings" in fields else None
+    updated = _repo(request).update_project(project_id, **fields)
+    if wake_before is not None:
+        child_wake.take_baseline(_repo(request), wake_before)
+    return _project_out(updated)
 
 
 @router.post("/projects/{project_id}/mark-viewed")

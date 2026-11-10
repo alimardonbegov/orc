@@ -35,6 +35,8 @@ class VerifyOutcome:
     output: str
     cmd: str
     duration_sec: float
+    exit_code: int | None = None
+    timed_out: bool = False
 
 
 @dataclass
@@ -93,7 +95,8 @@ class VerifyPool:
         except Exception as e:  # must not get here: _run catches everything itself
             log.exception("verify #%s crashed past the handler", task_id)
             result, duration = VerifyResult(False, f"verify crashed inside the pool: {e}"), 0.0
-        return VerifyOutcome(task_id, job.job_id, result.ok, result.output, job.cmd, duration)
+        return VerifyOutcome(task_id, job.job_id, result.ok, result.output, job.cmd, duration,
+                              result.exit_code, result.timed_out)
 
     def running(self) -> list[int]:
         with self._lock:

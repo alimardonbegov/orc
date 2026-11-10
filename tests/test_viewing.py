@@ -153,7 +153,8 @@ def test_migration_keeps_only_last_day_unviewed(tmp_path):
     failed = repo.add_task(project.id, "failed", "d", status="failed")
 
     # Roll the version back to the state "the viewing migration has not run yet" and bring the database up again
-    conn.execute(f"PRAGMA user_version = {db.SCHEMA_VERSION - 1}")
+    # (the migration list grows at the end, so it is found by name, not counted from the end)
+    conn.execute(f"PRAGMA user_version = {db.MIGRATIONS.index(db._seed_viewed) + 1}")
     conn.commit()
     init_schema(conn)
 

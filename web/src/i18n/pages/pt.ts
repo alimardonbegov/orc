@@ -136,7 +136,7 @@ export const pagesPt: PagesDictionary = {
     risks: {
       noHuman: {
         title: "Nenhum humano entre o agente e o origin",
-        body: "O merge, e o push se estiver ligado, seguem o relatório que o próprio agente escreve. O `verify_cmd` é a única voz independente.",
+        body: "O merge, e o push se estiver ligado, seguem a palavra do próprio agente de que o trabalho está feito. O `verify_cmd` é a única voz independente.",
       },
       verifyEdited: {
         title: "O verify_cmd executa código que o agente acabou de editar",
@@ -210,7 +210,7 @@ export const pagesPt: PagesDictionary = {
         steps: {
           s1: "Nome e caminho do repositório. Pasta sem git? O orc oferece executar `git init` com um primeiro commit vazio no main.",
           s2: "«Agentes ao mesmo tempo» — quantas tarefas deste projeto rodam em paralelo. As configurações do orc também têm um limite geral.",
-          s3: "«Como executar os agentes» — modelo, esforço e modo de permissão padrão para as tarefas novas. Cada tarefa pode substituí-los.",
+          s3: "«Agentes»: quem lidera o projeto e quantos rodam ao mesmo tempo. Modelo, esforço e modo de permissões são definidos em cada agente; os valores do projeto («Ajustes de reserva», nas configurações do projeto) valem só para um agente que não os define.",
           s4: "«Branch base» — de onde partem os branches das tarefas e para onde os resultados voltam. Vazio significa o branch aberto no repositório no momento.",
           s5: "«Verificação antes do merge» — o comando verify (por exemplo, `make test`) e seu tempo limite. Esta é a principal barreira de segurança: sem ela, o merge confia apenas na palavra do agente.",
           s6: "«Depois do merge» — push para o origin. Desligado por padrão: o orc nunca faz push sozinho até você ativar.",
@@ -226,12 +226,26 @@ export const pagesPt: PagesDictionary = {
         steps: {
           s1: "Título — um nome curto para o quadro.",
           s2: "«Tarefa para o agente» — o que fazer, onde está e como verificar. Cole capturas de tela exatamente onde fazem sentido: Ctrl+V, arrastando ou pelo botão «Imagem». «Texto / Pré-visualização» mostra o que o agente vai ver.",
-          s3: "«Parâmetros de execução» — modelo, esforço e modo de permissão. Um campo vazio usa o valor do projeto e o acompanha se o projeto mudar.",
+          s3: "«Responsável» — o agente que faz o trabalho. O modelo, o esforço e o modo de permissões vêm do agente; um cartão sem responsável fica com você e não vai para o trabalho.",
           s4: "Modos de permissão: `auto` — o Claude decide sozinho; `acceptEdits` — edita arquivos sem perguntar; `dontAsk` — nunca pergunta, e o que não está pré-aprovado simplesmente não é executado; `bypassPermissions` — nenhuma verificação, apenas para seus próprios repositórios.",
-          s5: "Prioridade, branch base e «Bloqueada por tarefas»: uma tarefa dependente espera até as tarefas das quais depende serem concluídas, mesmo em outros projetos.",
+          s5: "Prioridade, branch base e «Aguarda»: um cartão espera até que os cartões dos quais depende sejam mesclados, mesmo em outros projetos. «Adicionar propriedade» adiciona etiquetas e datas de plano, que a fila nunca lê.",
           s6: "Deixe o cartão em «Pendentes» como anotação, ou coloque-o em «A fazer» — o despachante o pega no próximo ciclo. Um cartão com o encargo vazio não pode ir para «A fazer».",
         },
         tip: "O branch base pode ser alterado enquanto o cartão está em «Pendentes» ou «A fazer». Depois que a tarefa começa, a cópia de trabalho já existe e é tarde demais.",
+      },
+      card: {
+        title: "O cartão",
+        where: "Clique em um cartão do quadro",
+        intro: "Um cartão descreve o trabalho uma vez, e tudo entre você e o agente acontece na conversa dele. A coluna da esquerda é para ler; a da direita, para os fatos.",
+        steps: {
+          s1: "A descrição fica no lugar: uma pergunta do agente nunca a empurra. Clique para editar; o campo cresce com o texto.",
+          s2: "«Relações»: o que o cartão aguarda, o que vem a seguir e as subtarefas com um anel feitas/total. «+» cria uma subtarefa com o projeto, a branch e o agente do pai; «Lista / Árvore» mostra toda a cadeia em volta do cartão.",
+          s3: "«Conversa»: as mensagens e comandos da sessão e as etapas que o orc adiciona — entregue, verificação, merge, conflito. O campo abaixo muda com o estado: «Enviar ao agente» enquanto o agente trabalha ou espera, «Continuar» e «Tentar novamente» após uma falha, «Retomar» quando o cartão está pronto.",
+          s4: "«Nota, o agente não a vê» fica no cartão e nunca chega à sessão.",
+          s5: "A coluna da direita: status, responsável, prioridade, branch e as propriedades que você adicionou. O «Registro de execução» lista cada execução com o motivo, o desfecho e o custo, e cada verificação com a saída.",
+          s6: "«Detalhes» embaixo: quem criou o cartão, quando começou e terminou, a branch, o worktree e o comando para entrar na sessão.",
+        },
+        tip: "Um cartão abre no topo, para ler a tarefa. Ele abre no fim da conversa quando espera por você, e o chip do agente no cabeçalho também leva até lá.",
       },
       dispatcher: {
         title: "O que o despachante faz",
@@ -240,7 +254,7 @@ export const pagesPt: PagesDictionary = {
         steps: {
           s1: "Pega tarefas de «A fazer» enquanto houver vagas livres e cria um worktree com o branch `orc/task-<id>` a partir do branch base da tarefa.",
           s2: "Executa `claude --bg` ali com o seu encargo, modelo e modo de permissão. O cartão vai para «Em andamento».",
-          s3: "Quando a sessão termina, lê `.orchestrator/report.json`. Se o agente relata uma falha, a tarefa volta com a explicação dele.",
+          s3: "Espera o agente executar `orc task done` e terminar o turno. Se ele executar `orc task fail`, a tarefa para com o motivo dele. Se não fizer nenhum dos dois, o cartão espera por você. Se executar `orc task wakeup`, o cartão dorme sem vaga de worker até o despertar.",
           s4: "Executa o `verify_cmd` no worktree — o selo «verificando». Vermelho: a tarefa volta ao agente com a saída da verificação.",
           s5: "Verde: a tarefa entra na fila de merge — o selo «mesclando»: `--no-ff` no branch base, uma tarefa de cada vez. Depois, «Concluído».",
           s6: "O painel do despachante mostra o sinal de vida e os agentes ocupados. «Pausar» para de despachar tarefas novas; «Executar agora» faz uma passada sem esperar o temporizador.",
@@ -253,10 +267,11 @@ export const pagesPt: PagesDictionary = {
         intro: "Magenta é a única cor da interface que chama um humano. Um cartão que precisa de você sobe para o topo da coluna e ganha um selo.",
         steps: {
           s1: "O agente pediu permissão, fez uma pergunta ou propôs um plano — o cartão recebe «aguardando resposta», e o contador no cabeçalho aumenta.",
-          s2: "Abra o cartão: a pergunta do agente está no topo. Responda em «Resposta para o Claude» — capturas de tela também funcionam aqui.",
+          s2: "Abra o cartão. Uma permissão, uma escolha ou um plano chega como formulário no fim da conversa, no lugar do campo de texto. Uma pergunta simples é a última mensagem do agente, marcada «À espera da sua resposta»: responda no campo de texto — capturas de tela também funcionam aqui.",
           s3: "A resposta vai para a mesma sessão em segundos, e ela continua de onde parou.",
-          s4: "Você pode escrever para uma sessão em andamento sem ser chamado: o botão «Para a sessão» ao lado do campo de nota. O texto chega na próxima chamada de ferramenta, sem interrompê-la.",
-          s5: "Se a sessão não pegar a mensagem em alguns minutos, o cartão avisa e oferece «Interromper sessão» — então o texto é entregue com um reinício.",
+          s4: "Você pode escrever a uma sessão em andamento sem ser perguntado: «Enviar ao agente» no campo de texto. O texto chega na próxima chamada de ferramenta sem interrompê-la; «Interromper» para antes o passo atual, como Esc.",
+          s5: "Uma mensagem a caminho mostra o estado abaixo dela: «à espera do próximo passo do agente», depois «lido». Se o agente está num passo longo, «Interromper» o para, como Esc, e ele lê a sua mensagem mais cedo.",
+          s6: "O agente entrega o trabalho com `orc task done`. Se parou sem isso e o trabalho parece pronto, «Aceitar o trabalho» ao lado de «Enviar ao agente» o entrega por ele: a verificação roda mesmo assim.",
         },
         tip: "Perguntas de outros projetos aparecem como um chip separado na mesma barra — o despachante é compartilhado, então nada se perde.",
       },
@@ -266,7 +281,7 @@ export const pagesPt: PagesDictionary = {
         intro: "A maioria dos problemas se resolve sem você. Veja o que o orc faz sozinho e quando ele chama você.",
         steps: {
           s1: "Conflito de merge: a tarefa que chega em segundo lugar encontra edições alheias nos seus arquivos. O orc devolve o conflito à sessão que escreveu o código; ela o resolve pelo sentido, passa de novo pela verificação e volta à fila de merge. Depois de três tentativas — o selo «conflito».",
-          s2: "Uma tarefa que falhou fica vermelha, e o motivo está no cartão. «Tentar novamente» começa do zero; «Retomar sessão» continua a mesma sessão.",
+          s2: "Uma tarefa que falhou fica vermelha, e o motivo está na conversa dela. «Continuar» retoma a mesma sessão, com a sua mensagem se você escrever uma; «Tentar novamente» começa do zero; «Aceitar o trabalho» envia o que a sessão fez para a verificação.",
           s3: "Cota: quando o limite do Claude acaba, a tarefa espera com o selo «cota», e o despachante a retoma após o reinício.",
           s4: "«sem confiança»: o Claude Code não inicia sessões numa pasta em que você não confiou. «Confiar na pasta e iniciar» resolve isso uma vez por projeto.",
           s5: "«cópia suja»: o branch de destino tem um merge, rebase ou cherry-pick inacabado. O orc não mexe nele — termine a operação, e a tarefa continua.",
@@ -361,7 +376,7 @@ export const pagesPt: PagesDictionary = {
         c1: "Há uma vaga livre — a tarefa é tirada da fila.",
         c2: "Um worktree e um branch separados são criados para ela.",
         c3: "`claude --bg` começa com o seu encargo.",
-        c4: "A sessão termina e escreve o relatório.",
+        c4: "A sessão executa `orc task done` e termina o turno.",
         c5: "O `verify_cmd` roda no worktree da tarefa.",
         c6: "Merge no branch base, uma tarefa de cada vez.",
       },
@@ -375,8 +390,8 @@ export const pagesPt: PagesDictionary = {
       captions: {
         c1: "O agente está trabalhando.",
         c2: "Ele tem uma pergunta: o cartão fica magenta e sobe.",
-        c3: "Você abre o cartão e vê a pergunta.",
-        c4: "Você responde em «Resposta para o Claude».",
+        c3: "Você abre o cartão: a pergunta é a última mensagem dele.",
+        c4: "Você responde no campo de texto logo abaixo.",
         c5: "A resposta chega à mesma sessão, e o trabalho continua.",
       },
     },

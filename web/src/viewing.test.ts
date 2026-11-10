@@ -4,7 +4,7 @@ import type { Project, Task } from "./types";
 
 const base: Task = {
   id: 1, project_id: 1, title: "", description: "", status: "done", priority: "normal", blocker: null,
-  blocker_detail: null, target_branch: null, model: null, effort: null, permission_mode: null, verify_cmd: null,
+  blocker_detail: null, target_branch: null, verify_cmd: null,
   requires_review: 0, worktree_path: null, branch: null, job_id: null, session_id: null, auto_resume_count: 0,
   state_miss_count: 0, quota_retry_count: 0, conflict_retry_count: 0, resume_with: null, outbox_state: null,
   merge_queued_at: null, retry_after: null, report_json: null,

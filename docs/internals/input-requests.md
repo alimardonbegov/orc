@@ -53,7 +53,7 @@ request in orc (`POST /api/hooks/input-requests`) and polls it every two seconds
 answers. All that time the tool "hangs" inside the session — the session is alive, nothing is
 stopped or resumed, no copies appear. The ceiling for the wait is the hook's `timeout`, one day.
 
-The hook gets `--secret-file` with the path to `<worktree>/.orchestrator/hook-secret` and sends its
+The hook gets `--secret-file` with the path to `<data>/hook-secrets/task-<id>` and sends its
 contents in the `X-Orc-Hook` header; both `/api/hooks/*` endpoints compare it with the secret of
 the task named in the request. A task without a secret (`hook_secret` is NULL: not yet issued or
 reset) is rejected with 403 — the permission channel is open only to a session that was issued a
@@ -98,7 +98,7 @@ catches sessions without hooks (started before hooks were introduced), cases whe
 unreachable at the moment of the dialog (the hook then exits silently and Claude Code shows its own
 dialog), and text questions at the end of a turn.
 
-An answer from the card's common field goes as before — stop + resume. For a text question this is
+An answer from the card's composer goes as before — stop + resume. For a text question this is
 a full answer; for a permission it is only a way to rephrase the task so that the agent does not
 call that tool.
 
@@ -157,6 +157,9 @@ The price is that a genuine text wait appears on the board not instantly but wit
 half. For dialogs (permission, question, plan) there is no delay at all: they are brought by the
 hook, and it registers the request immediately.
 
+> The sections below tell how this was found, when `report.json` was the signal. It is `orc task done`
+> now, compared with the start of the turn in the same way: see [handoff.md](handoff.md).
+
 ### Final report instead of a question
 
 The same heuristic also catches the end of the work: the agent handed in the task with a report
@@ -176,6 +179,21 @@ What was done (`orc/transcript.py`, `Dispatcher._reported_this_turn`):
 - **The agent's words instead of the daemon's retelling.** If it is a question after all, the
   agent's final text goes into `blocker_detail` (the text blocks after the last tool call, up to
   4000 characters), and the daemon's `needs`/`detail` are used only when there is no transcript.
+
+### A report that stops for the owner: `needs_input`
+
+The opposite mistake. A session built what was asked, published a page with four questions for the
+owner, wrote `report.json` with `status: success` as the prompt told it to, and ended its turn. By the
+rule above the work was handed in: the card went through verification to the merge queue while the owner
+was still reading the questions.
+
+The final text cannot tell these apart: "what I need from you" in a finished report and a real question
+look the same, and judging by text is what got the daemon into trouble above. So the agent says it
+itself, with `status: needs_input` in the report. `_reported_this_turn` does not count such a report, and
+the card gets the usual "waiting for reply" badge with the agent's final text. Ending the turn with a
+question and writing no report has the same effect. The rule is in the default prompt template and, since
+a project can replace the template, in the system prompt of every task session
+(`task_guide.HANDOFF_RULE`).
 
 ### Stuck `inFlight`: the card is "in progress" forever
 
@@ -268,6 +286,21 @@ unnoticed: the daemon set `done` itself, and nobody looked at `inFlight`.
 - Delivery is fixed as well: an idle session with a subscription used to count as "working, not
   waiting", and the owner's message went into the inbox, which nobody reads in a standing session.
 
+## Chats
+
+A direct chat (orc/chats.py) has no card, but its session hits the same dialogs. Chat sessions get the
+same hook with `--chat <id>` instead of `--task <id>`, and a secret in `<data>/hook-secrets/chat-<id>`
+(`chats.hook_secret`, reissued with every set of session settings).
+
+- A request is a `chat_messages` row with role `input_request` and state `open | answered | cancelled`;
+  the body is JSON (`kind`, `tool_name`, `tool_input`, `summary`, `decision`, `answered_at`). No new table:
+  the request sits in the conversation where the owner is reading.
+- Endpoints: `POST/GET /api/hooks/chat-input-requests` for the hook, `POST /api/chats/{id}/input-requests/{mid}/answer`
+  for the dashboard. Decisions are validated by the same `inputs.validate_decision`.
+- While a request is open the chat is `waiting` with the request summary. A new message from the owner
+  stops the session and cancels the request, as for a card. The `needs` fallback of `state.json` stays for
+  dialogs the hook did not catch, and is muted for `INPUT_ANSWER_GRACE_SEC` after an answer.
+
 ## Request lifecycle
 
 ```
@@ -298,9 +331,9 @@ A new request of the same task closes the previous one: its hook no longer exist
 - **The task card** has the `InputRequestPanel` panel at the very top: for a permission — the
   command and the buttons "Allow", "Allow for the rest of the session", "Deny…" (with a reason that
   goes to the agent); for a question — the options as buttons (single or multiple choice), a
-  "custom answer" field; for a plan — the plan text, "Approve plan", "Return with notes…". The
-  common "Reply to Claude" field is hidden while a request is open: text sent past the request would
-  not reach the session.
+  "custom answer" field; for a plan — the plan text, "Approve plan", "Return with notes…". A message
+  sent past the request dismisses it with Esc, as it would in a console, see
+  [message-delivery.md](message-delivery.md).
 
 ## Limits
 

@@ -62,7 +62,7 @@ describe("help pages", () => {
     renderPages("guide");
     const toc = screen.getByRole("navigation", { name: "Contents" });
     const items = within(toc).getAllByRole("button");
-    expect(items).toHaveLength(11);
+    expect(items).toHaveLength(12);
     expect(items[0]).toHaveTextContent("Before you start");
     expect(items.at(-1)).toHaveTextContent("Hotkeys");
   });

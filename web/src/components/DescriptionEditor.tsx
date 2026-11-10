@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ImagePlus, Loader2 } from "lucide-react";
 import { api } from "../api";
 import {
@@ -8,11 +8,13 @@ import {
   fileToBase64,
   imageMarker,
   imagesFrom,
+  imagesToUpload,
   insertMarker,
 } from "../attachments";
 import { DescriptionView } from "./DescriptionView";
 import { Button } from "../ui/Button";
-import { Textarea } from "../ui/Field";
+import { AutoGrowTextarea } from "../ui/Field";
+import { textBox, textBoxBleed } from "../ui/tokens";
 import { Segmented } from "../ui/Segmented";
 import { cn } from "../lib/cn";
 import { useTranslation } from "../i18n";
@@ -26,8 +28,16 @@ interface Props {
   className?: string;
   /** Field height: for an agent reply it is lower than for the task description. */
   textareaClassName?: string;
+  /** Focus the field when it appears, without scrolling the page to it. */
   autoFocus?: boolean;
+  /** Where the caret goes on that focus; the end of the text when absent. */
+  initialCaret?: number;
+  /** The least height of the field in px: what the text measured as a view, so a short text does not collapse. */
+  minHeight?: number;
+  /** Pull the field out by its own border and padding so that its text lines up with the text around it. */
+  bleed?: boolean;
 }
+
 
 type Mode = "text" | "preview";
 
@@ -39,7 +49,9 @@ type Mode = "text" | "preview";
  * is the place where it was inserted. The "Preview" switch shows the result: in "Text" the marker
  * is visible (otherwise it could not be moved or deleted), in "Preview" the image itself.
  */
-export function DescriptionEditor({ value, onChange, placeholder, label, className, textareaClassName, autoFocus }: Props) {
+export function DescriptionEditor({
+  value, onChange, placeholder, label, className, textareaClassName, autoFocus, initialCaret, minHeight, bleed,
+}: Props) {
   const { t } = useTranslation();
   const area = useRef<HTMLTextAreaElement>(null);
   const picker = useRef<HTMLInputElement>(null);
@@ -48,6 +60,17 @@ export function DescriptionEditor({ value, onChange, placeholder, label, classNa
   const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const images = countImages(value);
+
+  // Focus once, when the field appears. The `autoFocus` attribute would scroll the page to the field,
+  // and in a long description clicked in the middle that is the very jump we are removing.
+  const focusPlan = useRef({ autoFocus, initialCaret });
+  useEffect(() => {
+    const el = area.current;
+    if (!focusPlan.current.autoFocus || !el) return;
+    el.focus({ preventScroll: true });
+    const at = Math.min(focusPlan.current.initialCaret ?? el.value.length, el.value.length);
+    el.setSelectionRange(at, at);
+  }, []);
 
   /** Upload files one by one and place the markers in a row, keeping the selection order. */
   async function addImages(files: File[]) {
@@ -87,8 +110,58 @@ export function DescriptionEditor({ value, onChange, placeholder, label, classNa
     });
   }
 
+  const floor = minHeight ? { minHeight } : undefined;
   return (
     <div className={cn("space-y-1.5", className)}>
+      {mode === "text" ? (
+        <AutoGrowTextarea
+          ref={area}
+          wrapperClassName={bleed ? textBoxBleed : undefined}
+          className={cn("min-h-36", textareaClassName, dragging && "border-[var(--st-todo)]")}
+          minHeight={minHeight}
+          placeholder={placeholder}
+          aria-label={label}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+          onPaste={(e) => {
+            const files = imagesToUpload(e.clipboardData);
+            if (files.length === 0) return;   // text, even with a picture beside it, is pasted as usual
+            e.preventDefault();
+            void addImages(files);
+          }}
+          onDragOver={(e) => {
+            if (imagesFrom(e.dataTransfer).length === 0) return;
+            e.preventDefault();
+            setDragging(true);
+          }}
+          onDragLeave={() => setDragging(false)}
+          onDrop={(e) => {
+            const files = imagesFrom(e.dataTransfer);
+            setDragging(false);
+            if (files.length === 0) return;
+            e.preventDefault();
+            void addImages(files);
+          }}
+        />
+      ) : (
+        <div
+          className={cn(
+            textBox,
+            "min-h-36 rounded-[var(--radius-sm)] border-[var(--line)] bg-[var(--sunken)]",
+            bleed && textBoxBleed,
+            textareaClassName,
+          )}
+          style={floor}
+        >
+          {value.trim() ? (
+            <DescriptionView text={value} plain />
+          ) : (
+            <p className="text-[12px] text-[var(--ink-faint)]">{t("descriptionEditor.emptyPreview")}</p>
+          )}
+        </div>
+      )}
+
+      {/* Under the field, not above it: a bar above would push the text down the moment the field opens. */}
       <div className="flex items-center gap-2">
         <Segmented
           ariaLabel={t("descriptionEditor.viewSwitch", { label })}
@@ -124,45 +197,6 @@ export function DescriptionEditor({ value, onChange, placeholder, label, classNa
           {busy > 0 ? t("descriptionEditor.uploading") : images > 0 ? t("descriptionEditor.imageCount", { count: images }) : t("descriptionEditor.pasteHint")}
         </span>
       </div>
-
-      {mode === "text" ? (
-        <Textarea
-          ref={area}
-          className={cn("min-h-36", textareaClassName, dragging && "border-[var(--st-todo)]")}
-          placeholder={placeholder}
-          aria-label={label}
-          autoFocus={autoFocus}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          onPaste={(e) => {
-            const files = imagesFrom(e.clipboardData);
-            if (files.length === 0) return;   // plain text is pasted as usual
-            e.preventDefault();
-            void addImages(files);
-          }}
-          onDragOver={(e) => {
-            if (imagesFrom(e.dataTransfer).length === 0) return;
-            e.preventDefault();
-            setDragging(true);
-          }}
-          onDragLeave={() => setDragging(false)}
-          onDrop={(e) => {
-            const files = imagesFrom(e.dataTransfer);
-            setDragging(false);
-            if (files.length === 0) return;
-            e.preventDefault();
-            void addImages(files);
-          }}
-        />
-      ) : (
-        <div className={cn("min-h-36 rounded-[var(--radius-sm)] border border-[var(--line)] bg-[var(--sunken)] px-2.5 py-1.5", textareaClassName)}>
-          {value.trim() ? (
-            <DescriptionView text={value} />
-          ) : (
-            <p className="text-[12px] text-[var(--ink-faint)]">{t("descriptionEditor.emptyPreview")}</p>
-          )}
-        </div>
-      )}
 
       {error && <p className="text-[11px] text-[var(--danger)]">{error}</p>}
     </div>

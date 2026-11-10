@@ -5,8 +5,9 @@ import json
 
 from fastapi import APIRouter, HTTPException, Request
 
-from orc import usage
-from orc.api.common import SETTING_KEYS, _check_settings, _dispatcher, _repo, hidden_models_json
+from orc import quick_create, usage
+from orc import card_settings, child_wake
+from orc.api.common import SETTING_KEYS, _check_settings, _dispatcher, _repo, check_card_settings, hidden_models_json
 from orc.dispatcher import WORKTREE_RETENTION_DAYS
 from orc.prompt import CONFLICT_TEMPLATE, DEFAULT_TEMPLATE
 from orc.quota import DEFAULT_QUOTA_PATTERNS
@@ -32,6 +33,8 @@ def get_settings(request: Request):
         "global_max_workers": repo.get_setting("global_max_workers", "3"),
         "poll_interval_sec": repo.get_setting("poll_interval_sec", "30"),
         "prompt_template": repo.get_setting("prompt_template") or DEFAULT_TEMPLATE,
+        # Read-only: what the dialog's reset puts back when a kept template still orders report.json
+        "prompt_template_default": DEFAULT_TEMPLATE,
         "quota_patterns": repo.get_setting("quota_patterns") or json.dumps(DEFAULT_QUOTA_PATTERNS),
         # Resolve a conflict with the target branch using the task's own session rather than calling the human right away
         "conflict_autoresolve": repo.get_setting("conflict_autoresolve", "1"),
@@ -45,6 +48,11 @@ def get_settings(request: Request):
         # Models hidden from the model-selection dropdowns in all projects (JSON list of ids).
         # A project can set its own list on top of this (projects.hidden_models).
         "hidden_models": repo.get_setting("hidden_models", "[]"),
+        # What task cards show and start with (orc/card_settings.py), a JSON object.
+        # A project can override it key by key (projects.card_settings).
+        "card_settings": repo.get_setting("card_settings", "{}"),
+        # The model that drafts a card from the owner's words (orc/quick_create.py): a cheap one
+        "quick_create_model": repo.get_setting("quick_create_model") or quick_create.DEFAULT_MODEL,
     }
 
 
@@ -58,8 +66,15 @@ def patch_settings(body: dict[str, str], request: Request):
     if "hidden_models" in body:
         # Stored already normalized: no duplicates or empty ids, so the comparison in the dashboard is honest
         body = {**body, "hidden_models": hidden_models_json(json.loads(body["hidden_models"]))}
+    if "card_settings" in body:
+        # Without a project only a shared agent can be the default: other projects could not use an internal one
+        settings = check_card_settings(repo, json.loads(body["card_settings"]), None)
+        body = {**body, "card_settings": card_settings.dumps(settings)}
+    wake_before = child_wake.enabled_parents(repo) if "card_settings" in body else None
     for k, v in body.items():
         repo.set_setting(k, v)
+    if wake_before is not None:
+        child_wake.take_baseline(repo, wake_before)
     return get_settings(request)
 
 

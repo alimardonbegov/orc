@@ -60,7 +60,8 @@ def test_start_trusts_worktree_of_trusted_project(repo, dispatcher, fake_cli, pr
 def test_untrusted_project_fails_with_blocker_then_trust_button_starts(repo, dispatcher, fake_cli, project, client):
     cfg = dispatcher.settings.claude_json_path
     _config(cfg, {})
-    task = repo.add_task(project.id, "t", status=TaskStatus.TODO, description="d")
+    agent = repo.add_agent("Test agent")
+    task = repo.add_task(project.id, "t", status=TaskStatus.TODO, description="d", agent_id=agent.id)
     dispatcher.tick()
     task = repo.get_task(task.id)
     assert task.status == TaskStatus.FAILED and task.blocker == Blocker.UNTRUSTED
@@ -73,6 +74,25 @@ def test_untrusted_project_fails_with_blocker_then_trust_button_starts(repo, dis
     assert trust.is_trusted_exactly(cfg, project.path)
     dispatcher.tick()
     assert repo.get_task(task.id).status == TaskStatus.IN_PROGRESS
+
+
+def test_trust_restarts_other_untrusted_cards_of_the_project(repo, dispatcher, fake_cli, project, client):
+    _config(dispatcher.settings.claude_json_path, {})
+    agent = repo.add_agent("Test agent")
+    a, b, c = (repo.add_task(project.id, n, status=TaskStatus.TODO, description="d", agent_id=agent.id)
+               for n in "abc")
+    dispatcher.tick()
+    assert repo.get_task(a.id).blocker == Blocker.UNTRUSTED
+    assert repo.get_task(b.id).blocker == Blocker.UNTRUSTED
+    # c failed for another reason: it must stay as it is
+    repo.update_task(c.id, status=TaskStatus.FAILED, blocker=Blocker.QUOTA, blocker_detail="x")
+
+    assert client.post(f"/api/tasks/{a.id}/trust").status_code == 200
+    assert repo.get_task(a.id).status == TaskStatus.TODO
+    assert repo.get_task(b.id).status == TaskStatus.TODO
+    assert repo.get_task(b.id).blocker is None
+    assert repo.get_task(c.id).status == TaskStatus.FAILED and repo.get_task(c.id).blocker == Blocker.QUOTA
+    assert any(f"#{b.id}" in e["message"] and "also sent back" in e["message"] for e in repo.list_events())
 
 
 def test_trust_endpoint_only_for_untrusted_failures(repo, project, client):

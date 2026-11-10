@@ -3,8 +3,9 @@ import userEvent from "@testing-library/user-event";
 import { it, expect, vi, describe, beforeEach } from "vitest";
 import { ProjectDialog } from "./ProjectDialog";
 import { AppHiddenModelsContext } from "../hiddenModels";
+import { AgentsContext } from "../agents";
 import { api } from "../api";
-import type { ClaudeMd, ClaudeMdFile, Project, ProjectPathCheck } from "../types";
+import type { Agent, ClaudeMd, ClaudeMdFile, Project, ProjectPathCheck } from "../types";
 
 vi.mock("../api", () => ({
   api: {
@@ -103,6 +104,14 @@ describe("project settings", () => {
     await waitFor(() => expect(api.addProject).toHaveBeenCalled());
     expect(vi.mocked(api.addProject).mock.calls[0][0]).toMatchObject({ name: "New", path: "/repo/new", init_git: false });
     expect(onSaved).toHaveBeenCalled();
+  });
+
+  it("a new project has no model fields: agents decide, the fallback lives only in settings", () => {
+    open(null);
+    expect(screen.queryByText("Fallback run settings")).toBeNull();
+    expect(screen.queryByText("Models in the list")).toBeNull();
+    open(projectA);
+    expect(screen.getByText("Fallback run settings")).toBeInTheDocument();
   });
 
   it("an empty path is not a refusal but a choice: cancel or create a folder with git", async () => {
@@ -391,4 +400,25 @@ describe("model visibility in the project", () => {
     await waitFor(() => expect(api.patchProject).toHaveBeenCalledTimes(1));
     expect(vi.mocked(api.patchProject).mock.calls[0][1]).toMatchObject({ hidden_models: null });
   });
+});
+
+it("appointing a lead alone counts as a change and goes out with the save", async () => {
+  vi.mocked(api.patchProject).mockResolvedValue({ ...projectA, lead_agent_id: 4 });
+  const agent: Agent = {
+    id: 4, name: "Lena", description: "", avatar: null, model: null, effort: null, permission_mode: null, prompt: "",
+    project_id: null, memory_enabled: false, created_at: "", updated_at: "", tasks: { active: 0, total: 0 },
+  };
+  const onSaved = vi.fn();
+  render(
+    <AgentsContext.Provider value={[agent]}>
+      <ProjectDialog open onOpenChange={vi.fn()} project={projectA} onSaved={onSaved} />
+    </AgentsContext.Provider>,
+  );
+  const save = await screen.findByRole("button", { name: "Save" });
+  expect(save).toBeDisabled();
+  await userEvent.selectOptions(screen.getByRole("combobox", { name: "Project lead" }), "4");
+  expect(save).toBeEnabled();
+  await userEvent.click(save);
+  await waitFor(() => expect(api.patchProject).toHaveBeenCalledTimes(1));
+  expect(vi.mocked(api.patchProject).mock.calls[0][1]).toMatchObject({ lead_agent_id: 4 });
 });

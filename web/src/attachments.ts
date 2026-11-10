@@ -54,6 +54,46 @@ export function parseDescription(text: string): Segment[] {
   return out;
 }
 
+/** A segment as the view shows it, with where it sits in the raw text (the caret is carried over by it). */
+export type DisplaySegment =
+  | { kind: "text"; text: string; start: number }
+  | { kind: "image"; id: number; alt: string; start: number; end: number };
+
+/**
+ * The segments the view draws: newlines around a marker are a trace of the editor setting it off from
+ * the text. On screen the image itself provides the spacing, and a blank line on top turns into a
+ * hole. Only those are cut: inside the text the owner's formatting is left alone.
+ */
+export function displaySegments(text: string): DisplaySegment[] {
+  const raw: Array<DisplaySegment | null> = [];
+  let last = 0;
+  MARKER.lastIndex = 0;
+  for (let m = MARKER.exec(text); m !== null; m = MARKER.exec(text)) {
+    if (m.index > last) raw.push({ kind: "text", text: text.slice(last, m.index), start: last });
+    raw.push({ kind: "image", id: Number(m[2]), alt: m[1], start: m.index, end: m.index + m[0].length });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) raw.push({ kind: "text", text: text.slice(last), start: last });
+  const out: DisplaySegment[] = [];
+  raw.forEach((s, i) => {
+    if (!s) return;
+    if (s.kind === "image") {
+      out.push(s);
+      return;
+    }
+    let body = s.text;
+    let start = s.start;
+    if (raw[i - 1]?.kind === "image") {
+      const cut = body.match(/^\n{1,2}/)?.[0].length ?? 0;
+      body = body.slice(cut);
+      start += cut;
+    }
+    if (raw[i + 1]?.kind === "image") body = body.replace(/\n{1,2}$/, "");
+    if (body !== "") out.push({ kind: "text", text: body, start });
+  });
+  return out;
+}
+
 export function countImages(text: string): number {
   return parseDescription(text).filter((s) => s.kind === "image").length;
 }
@@ -107,6 +147,22 @@ export function imagesFrom(source: DataTransfer | null | undefined): File[] {
   }
   const files = fromItems.length > 0 ? fromItems : Array.from(source.files ?? []);
   return files.filter((f) => f.type.startsWith("image/"));
+}
+
+/**
+ * Images to upload from a paste, or an empty list when the browser should paste as usual.
+ *
+ * Copying from a spreadsheet, a web page or a chat puts both the text and a picture of it on the
+ * clipboard. Taking over such a paste swallowed the text: nothing appeared in the field. So the text
+ * wins, and the images are taken only when there is no text, or the text is just the file name
+ * (a file copied in Finder carries its name as text).
+ */
+export function imagesToUpload(source: DataTransfer | null | undefined): File[] {
+  const files = imagesFrom(source);
+  if (files.length === 0) return [];
+  const text = (source?.getData?.("text/plain") ?? "").trim();
+  if (text === "" || files.some((f) => f.name === text)) return files;
+  return [];
 }
 
 export type Uploader = (body: { filename: string; mime: string; data: string }) => Promise<Attachment>;

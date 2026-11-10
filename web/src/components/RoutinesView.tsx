@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { toast } from "sonner";
-import { ChevronDown, ChevronRight, Coins, Pause, Pencil, Play, Plus, Repeat, Trash2, Zap } from "lucide-react";
+import { ChevronDown, ChevronRight, Coins, MessageSquare, Pause, Pencil, Play, Plus, Repeat, Trash2, Zap } from "lucide-react";
 import { api } from "../api";
 import type { Project, Routine, RoutineInput, RoutineRun } from "../types";
 import { usePolling } from "../hooks/usePolling";
@@ -12,32 +12,39 @@ import { formatDuration, fullDateTime, relativeTime } from "../dates";
 import { formatTokens } from "../usage";
 import { runDuration, runOutcome, scheduleText, slotTime, successRate, untilLabel } from "../routines";
 import { Badge, Dot } from "../ui/Badge";
+import { ProjectTag } from "./ProjectTag";
 import { Button, IconButton } from "../ui/Button";
 import { Tip } from "../ui/Overlays";
 import { Modal } from "../ui/Modal";
 import { Confirm } from "../ui/Confirm";
 import { cn } from "../lib/cn";
 import { focusRing } from "../ui/tokens";
+import { useAgents } from "../agents";
 import { RoutineForm } from "./RoutineForm";
 
 interface Props {
-  project: Project;
+  /** The project whose routines are shown; null — the "Routines" page with all of them, projects or not. */
+  project: Project | null;
+  projects: Project[];
   /** Whether runs can be created in the project: the folder is in place and the project is not
    * archived. */
   canCreate: boolean;
   onOpenTask: (id: number) => void;
+  /** A routine outside a project runs as chats: its history opens the chat. */
+  onOpenChat: (id: number) => void;
   /** The board must learn about a new run right away, not on the next poll. */
   onTasksChanged: () => void;
 }
 
 /**
- * Project recurring tasks: what runs, when the next run is, how many there have been and how they
- * ended. Each run is an ordinary card on the board; here is their history in one place and the
- * routine's levers: run now, pause, edit, delete.
+ * Recurring tasks: what runs, when the next run is, how many there have been and how they ended.
+ * A run in a project is an ordinary card on the board; a run of a routine outside any project is a
+ * chat with its agent. Here is their history in one place and the routine's levers: run now,
+ * pause, edit, delete.
  */
-export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }: Props) {
+export function RoutinesView({ project, projects, canCreate, onOpenTask, onOpenChat, onTasksChanged }: Props) {
   const { t } = useTranslation();
-  const routines = usePolling(() => api.routines(project.id), 5000, [project.id]);
+  const routines = usePolling(() => api.routines(project?.id), 5000, [project?.id ?? null]);
   const [form, setForm] = useState<{ routine?: Routine } | null>(null);
   const [formPending, setFormPending] = useState(false);
   const [deleting, setDeleting] = useState<Routine | null>(null);
@@ -59,12 +66,12 @@ export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }:
       .finally(() => setBusy(null));
   };
 
-  const submit = (values: RoutineInput) => {
+  const submit = (values: RoutineInput, projectId: number | null) => {
     setFormPending(true);
     const editing = form?.routine;
     const request = editing
-      ? api.patchRoutine(editing.id, values)
-      : api.addRoutine({ project_id: project.id, ...values });
+      ? api.patchRoutine(editing.id, projectId === editing.project_id ? values : { ...values, project_id: projectId })
+      : api.addRoutine({ project_id: projectId, ...values });
     request
       .then(() => {
         toast.success(editing ? t("routines.savedToast") : t("routines.createdToast"));
@@ -81,9 +88,11 @@ export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }:
         <div className="min-w-0">
           <h2 className="flex items-center gap-1.5 text-[14px] font-semibold text-[var(--ink)]">
             <Repeat size={14} aria-hidden className="text-[var(--ink-faint)]" />
-            {t("routines.heading")}
+            {project ? t("routines.heading") : t("routines.title")}
           </h2>
-          <p className="text-[12px] text-[var(--ink-muted)]">{t("routines.subheading")}</p>
+          <p className="text-[12px] text-[var(--ink-muted)]">
+            {project ? t("routines.subheading") : t("routines.subheadingAll")}
+          </p>
         </div>
         <Button icon={Plus} variant="primary" className="ml-auto" disabled={!canCreate} onClick={() => setForm({})}>
           {t("routines.newButton")}
@@ -116,7 +125,12 @@ export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }:
               expanded={expanded === r.id}
               busy={busy === r.id}
               onToggleExpand={() => setExpanded((cur) => (cur === r.id ? null : r.id))}
-              onRunNow={() => act(r.id, () => api.runRoutine(r.id), t("routines.runStartedToast"))}
+              projectName={project ? null : (projects.find((p) => p.id === r.project_id)?.name ?? null)}
+              showProject={project === null}
+              onRunNow={() =>
+                act(r.id, () => api.runRoutine(r.id),
+                  r.project_id === null ? t("routines.runStartedChatToast") : t("routines.runStartedToast"))
+              }
               onToggleEnabled={() =>
                 act(r.id, () => api.patchRoutine(r.id, { enabled: !r.enabled }),
                   r.enabled ? t("routines.pausedToast") : t("routines.resumedToast"))
@@ -124,6 +138,7 @@ export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }:
               onEdit={() => setForm({ routine: r })}
               onDelete={() => setDeleting(r)}
               onOpenTask={onOpenTask}
+              onOpenChat={onOpenChat}
             />
           ))
         )}
@@ -134,11 +149,12 @@ export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }:
           open
           onOpenChange={(o) => !o && setForm(null)}
           title={form.routine ? t("routines.editTitle") : t("routines.newTitle")}
-          size="lg"
+          size="xl"
           sticky
         >
           <RoutineForm
-            project={project}
+            project={project ?? projects.find((p) => p.id === form.routine?.project_id) ?? null}
+            projects={projects}
             initial={form.routine}
             pending={formPending}
             submitLabel={form.routine ? t("common.save") : t("routines.createSubmit")}
@@ -167,7 +183,9 @@ export function RoutinesView({ project, canCreate, onOpenTask, onTasksChanged }:
               .finally(() => setDeletePending(false));
           }}
         >
-          <p>{t("routines.deleteBody", { title: deleting.title })}</p>
+          <p>
+            {t(deleting.project_id === null ? "routines.deleteBodyFree" : "routines.deleteBody", { title: deleting.title })}
+          </p>
         </Confirm>
       )}
     </div>
@@ -184,11 +202,25 @@ interface RowProps {
   onEdit: () => void;
   onDelete: () => void;
   onOpenTask: (id: number) => void;
+  onOpenChat: (id: number) => void;
+  /** The "Routines" page lists every project's routines, so each row says whose it is. */
+  showProject: boolean;
+  projectName: string | null;
 }
 
-function RoutineRow({ routine: r, expanded, busy, onToggleExpand, onRunNow, onToggleEnabled, onEdit, onDelete, onOpenTask }: RowProps) {
+/** A run opens where it lives: the card in the task dialog, the chat of a project-less routine in Chats. */
+function openRun(run: RoutineRun, onOpenTask: (id: number) => void, onOpenChat: (id: number) => void) {
+  if (run.chat_id !== null) onOpenChat(run.chat_id);
+  else if (run.task_id !== null) onOpenTask(run.task_id);
+}
+
+function RoutineRow({
+  routine: r, expanded, busy, onToggleExpand, onRunNow, onToggleEnabled, onEdit, onDelete, onOpenTask, onOpenChat,
+  showProject, projectName,
+}: RowProps) {
   const { t, language } = useTranslation();
   const now = useNow();
+  const agentName = useAgents().find((a) => a.id === r.agent_id)?.name ?? null;
   const next = r.next_run_at ? Date.parse(r.next_run_at) : null;
   const rate = successRate(r);
   const last = r.last_run;
@@ -219,9 +251,16 @@ function RoutineRow({ routine: r, expanded, busy, onToggleExpand, onRunNow, onTo
             <span className="flex items-center gap-1.5">
               <Dot tone={r.enabled ? "bg-[var(--ok)]" : "bg-[var(--ink-faint)]"} pulse={r.enabled && r.stats.active > 0} />
               <span className="truncate text-[13px] font-semibold text-[var(--ink)]">{r.title}</span>
+              {showProject &&
+                (r.project_id === null ? (
+                  <Badge icon={MessageSquare}>{t("routines.noProject")}</Badge>
+                ) : (
+                  <ProjectTag name={projectName} full />
+                ))}
             </span>
             <span className="mt-0.5 block text-[12px] text-[var(--ink-muted)]">
               <span className="font-mono text-[11px]">{scheduleText(t, r)}</span>
+              {agentName && <span> · {agentName}</span>}
               {" · "}
               {r.enabled && next !== null ? (
                 <span title={fullDateTime(next, language)}>
@@ -271,7 +310,7 @@ function RoutineRow({ routine: r, expanded, busy, onToggleExpand, onRunNow, onTo
       {last && lastMeta && !expanded && (
         <button
           type="button"
-          onClick={() => onOpenTask(last.task_id)}
+          onClick={() => openRun(last, onOpenTask, onOpenChat)}
           className={cn(
             "flex w-full items-center gap-2 border-t border-[var(--line)] px-3 py-1.5 text-left text-[12px] hover:bg-[var(--sunken)]",
             focusRing,
@@ -288,7 +327,7 @@ function RoutineRow({ routine: r, expanded, busy, onToggleExpand, onRunNow, onTo
         </button>
       )}
 
-      {expanded && <RunHistory routine={r} onOpenTask={onOpenTask} />}
+      {expanded && <RunHistory routine={r} onOpenTask={onOpenTask} onOpenChat={onOpenChat} />}
     </article>
   );
 }
@@ -303,7 +342,9 @@ function Stat({ label, value, tone }: { label: string; value: string; tone?: str
 }
 
 /** Run history: all routine runs, newest on top, including those moved to the archive. */
-function RunHistory({ routine, onOpenTask }: { routine: Routine; onOpenTask: (id: number) => void }) {
+function RunHistory({
+  routine, onOpenTask, onOpenChat,
+}: { routine: Routine; onOpenTask: (id: number) => void; onOpenChat: (id: number) => void }) {
   const { t, language } = useTranslation();
   const now = useNow();
   // Poll while the history is expanded: the status of a running run changes before your eyes.
@@ -330,7 +371,11 @@ function RunHistory({ routine, onOpenTask }: { routine: Routine; onOpenTask: (id
         </thead>
         <tbody>
           {runs.data.map((run) => (
-            <RunRow key={run.task_id} run={run} now={now} language={language} onOpen={() => onOpenTask(run.task_id)} />
+            <RunRow
+              key={run.chat_id !== null ? `chat-${run.chat_id}` : `task-${run.task_id}`}
+              run={run} now={now} language={language}
+              onOpen={() => openRun(run, onOpenTask, onOpenChat)}
+            />
           ))}
         </tbody>
       </table>
@@ -353,7 +398,9 @@ function RunRow({ run, now, language, onOpen }: { run: RoutineRun; now: number; 
           onOpen();
         }
       }}
-      title={t("routines.history.openTitle", { id: run.task_id })}
+      title={run.chat_id !== null
+        ? t("routines.history.openChatTitle", { id: run.chat_id })
+        : t("routines.history.openTitle", { id: run.task_id ?? 0 })}
       className={cn("cursor-pointer border-t border-[var(--line)] hover:bg-[var(--sunken)]", focusRing)}
     >
       <td className="tnum px-3 py-1.5 text-[var(--ink-muted)]">{run.run ?? "—"}</td>

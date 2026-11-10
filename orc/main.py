@@ -1,4 +1,4 @@
-"""`orc` entry point: serve | tick | db-path | doctor."""
+"""`orc` entry point: serve | tick | db-path | doctor | task."""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +12,7 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from orc import security
+from orc import security, task_cli
 from orc.claude_cli import ClaudeCli
 from orc.config import Settings, default_data_dir, default_static_dir, load_settings, running_from_source
 from orc.db import connect, init_schema
@@ -120,6 +120,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     sub.add_parser("tick", help="run one dispatcher pass and exit")
     sub.add_parser("db-path", help="print the database path")
     sub.add_parser("doctor", help="check the environment: git, claude, data directory, UI")
+    task_cli.add_parser(sub)
     return parser.parse_args(argv)
 
 
@@ -134,6 +135,9 @@ def main(argv: list[str] | None = None) -> None:
     if args.command == "doctor":
         # Before load_settings: the check must not create the data directory
         raise SystemExit(doctor())
+    if args.command == "task":
+        # Before load_settings as well: a client of the server must not create a data directory or open the database
+        raise SystemExit(task_cli.run(args))
     settings = load_settings()
     if args.command == "db-path":
         print(settings.db_path)
@@ -156,6 +160,7 @@ def main(argv: list[str] | None = None) -> None:
     hook_host = "127.0.0.1" if args.host in ("0.0.0.0", "::") else args.host
     settings.api_base = f"http://{hook_host}:{args.port}"
     app = create_app(settings, repo, dispatcher)
+    task_cli.write_server_url(settings.data_dir, settings.api_base)
     if args.open:
         threading.Timer(1.0, lambda: webbrowser.open(f"http://{args.host}:{args.port}")).start()
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

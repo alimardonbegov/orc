@@ -4,6 +4,7 @@ import shlex
 import stat
 from pathlib import Path
 
+from orc import inputs
 from orc.models import TaskStatus
 
 
@@ -73,9 +74,10 @@ def test_secret_is_issued_on_start_as_file(dispatcher, repo, project, fake_cli):
     dispatcher.tick()
     started = repo.get_task(task.id)
     assert started.hook_secret
-    secret_file = Path(started.worktree_path) / ".orchestrator" / "hook-secret"
+    secret_file = inputs.hook_secret_path(dispatcher.settings.data_dir, task.id)
     assert secret_file.read_text() == started.hook_secret
     assert stat.S_IMODE(secret_file.stat().st_mode) == 0o600
+    assert stat.S_IMODE(secret_file.parent.stat().st_mode) == 0o700
     # FakeClaudeCli writes tuples: ("start_bg", cwd, prompt, name, model, effort, mode, settings)
     settings = [c for c in fake_cli.calls if c[0] == "start_bg"][-1][7]
     command = json.loads(settings)["hooks"]["PermissionRequest"][0]["hooks"][0]["command"]
@@ -83,18 +85,12 @@ def test_secret_is_issued_on_start_as_file(dispatcher, repo, project, fake_cli):
     assert started.hook_secret not in settings
 
 
-def test_resume_with_new_settings_rotates_secret(dispatcher, repo, project, fake_cli):
+def test_every_resume_rotates_secret(dispatcher, repo, project, fake_cli):
     task = repo.add_task(project.id, "t", "d", status="todo")
     dispatcher.tick()
     first = repo.get_task(task.id)
-    secret_file = Path(first.worktree_path) / ".orchestrator" / "hook-secret"
+    secret_file = inputs.hook_secret_path(dispatcher.settings.data_dir, task.id)
 
-    # Waking a stopped session happens without settings, so the secret stays the same
-    dispatcher.sessions.resume(first, "continue", stopped=True)
-    assert repo.get_task(task.id).hook_secret == first.hook_secret
-    assert secret_file.read_text() == first.hook_secret
-
-    # A resume with new settings (done/failed → a session copy) issues a new secret
     repo.update_task(task.id, status=TaskStatus.FAILED)
     fake_cli.set_state(repo.get_task(task.id).job_id, "failed")  # failed session, no live process
     dispatcher.resume_failed(task.id)

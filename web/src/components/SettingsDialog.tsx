@@ -9,7 +9,13 @@ import { Segmented } from "../ui/Segmented";
 import { OrcLogo } from "../brand/OrcLogo";
 import { LANGUAGES, useTranslation } from "../i18n";
 import { parseHiddenModels } from "../models";
+import { ModelPicker } from "./ModelPicker";
 import { ModelVisibility } from "./ModelVisibility";
+import { CardSettingsEditor } from "./CardSettingsEditor";
+import { cleanCardSettings, parseCardSettings } from "../cardSettings";
+
+/** A kept prompt template that still tells the agent to write the old report. */
+const ORDERS_REPORT = /\{report_path\}|report\.json/;
 
 interface Props {
   open: boolean;
@@ -70,6 +76,7 @@ export function SettingsDialog({ open, onOpenChange, theme, onThemeChange, onSav
       for (const k of Object.keys(loaded) as (keyof Settings)[]) {
         if (loaded[k] !== draft[k]) body[k] = draft[k];
       }
+      if (body.card_settings !== undefined) body.card_settings = JSON.stringify(cleanCardSettings(parseCardSettings(body.card_settings)));
       const saved = await api.patchSettings(body);
       setLoaded(saved);
       setDraft(saved);
@@ -186,6 +193,26 @@ export function SettingsDialog({ open, onOpenChange, theme, onThemeChange, onSav
               />
             </Field>
 
+            <ModelPicker
+              label={t("settingsDialog.quickCreateModelLabel")}
+              value={draft.quick_create_model === "haiku" ? null : draft.quick_create_model}
+              onChange={(v) => set("quick_create_model", v ?? "haiku")}
+              defaultLabel={t("settingsDialog.quickCreateModelDefault")}
+              defaultHint={t("settingsDialog.quickCreateModelHint")}
+            />
+
+            <section className="space-y-2 border-t border-[var(--line)] pt-4">
+              <div>
+                <h3 className="text-[13px] font-semibold text-[var(--ink)]">{t("card.settings.heading")}</h3>
+                <p className="mt-0.5 text-[11px] leading-snug text-[var(--ink-faint)]">{t("card.settings.headingHint")}</p>
+              </div>
+              <CardSettingsEditor
+                projectId={null}
+                value={parseCardSettings(draft.card_settings)}
+                onChange={(next) => set("card_settings", JSON.stringify(next))}
+              />
+            </section>
+
             <Field
               label={t("settingsDialog.promptTemplateLabel")}
               hint={t("settingsDialog.promptTemplateHint")}
@@ -195,6 +222,14 @@ export function SettingsDialog({ open, onOpenChange, theme, onThemeChange, onSav
                 value={draft.prompt_template}
                 onChange={(e) => set("prompt_template", e.target.value)}
               />
+              {ORDERS_REPORT.test(draft.prompt_template) && (
+                <div className="mt-2 flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] bg-[color-mix(in_oklab,var(--warn)_12%,transparent)] px-3 py-2 text-[12px]">
+                  <p className="min-w-0 flex-1">{t("settingsDialog.promptTemplateReportWarning")}</p>
+                  <Button size="sm" onClick={() => set("prompt_template", draft.prompt_template_default)}>
+                    {t("settingsDialog.promptTemplateReset")}
+                  </Button>
+                </div>
+              )}
             </Field>
 
             <Field

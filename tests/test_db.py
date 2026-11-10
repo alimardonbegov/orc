@@ -135,3 +135,45 @@ def test_migrations_run_in_order_once(tmp_path, monkeypatch):
     init_schema(conn)          # already version 2: not applied again
     assert applied == ["m1"]
     assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_routines_project_id_becomes_nullable_keeping_rows(tmp_path):
+    """Routines outside a project need project_id to accept NULL: an old table (NOT NULL, with agent_id added
+    by ALTER) is rebuilt without losing rows or columns, and a repeated start leaves it alone."""
+    conn = connect(tmp_path / "old.db")
+    conn.executescript(SCHEMA.replace(
+        "  -- NULL means a routine outside any project: each run is a chat with its agent (orc/routines.py)\n"
+        "  project_id INTEGER REFERENCES projects(id) ON DELETE CASCADE,",
+        "  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,"))
+    conn.execute("ALTER TABLE routines ADD COLUMN agent_id INTEGER")
+    conn.execute("PRAGMA user_version = 3")  # the state before this migration
+    conn.execute("INSERT INTO projects (name, path, created_at) VALUES ('p', '/tmp/p', '2026-01-01T00:00:00+00:00')")
+    conn.execute(
+        "INSERT INTO routines (project_id, title, description, run_count, agent_id, created_at, updated_at) "
+        "VALUES (1, 'old routine', 'do it', 7, 5, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')")
+    conn.commit()
+    assert {r["name"]: r["notnull"] for r in conn.execute("PRAGMA table_info(routines)")}["project_id"] == 1
+
+    init_schema(conn)
+    info = {r["name"]: r["notnull"] for r in conn.execute("PRAGMA table_info(routines)")}
+    assert info["project_id"] == 0
+    repo = Repo(conn)
+    old = repo.get_routine(1)
+    assert (old.title, old.project_id, old.run_count, old.agent_id) == ("old routine", 1, 7, 5)
+    free = repo.add_routine(None, "free", description="x")  # NULL project_id is accepted now
+    assert free.project_id is None
+    init_schema(conn)  # a repeated start does not rebuild again
+    assert repo.get_routine(free.id).title == "free"
+
+
+def test_migration_clears_run_parameters_left_in_cards(tmp_path):
+    """A card is tied to its agent: values an older version stored in its row are cleared, not left to look like a setting."""
+    from orc import db
+    conn = db.connect(tmp_path / "orc.db")
+    db.init_schema(conn)
+    conn.execute("INSERT INTO projects (name, path, created_at) VALUES ('p', '/p', 't')")
+    conn.execute("INSERT INTO tasks (project_id, title, description, model, effort, permission_mode, created_at, updated_at) "
+                 "VALUES (1, 't', '', 'opus', 'high', 'auto', 't', 't')")
+    db._drop_card_run_parameters(conn)
+    row = conn.execute("SELECT model, effort, permission_mode FROM tasks").fetchone()
+    assert (row["model"], row["effort"], row["permission_mode"]) == (None, None, None)

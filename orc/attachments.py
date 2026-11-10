@@ -95,6 +95,23 @@ class AttachmentStore:
             path.write_bytes(data)
         return self.repo.add_attachment(filename=filename or rel, mime=mime, size=len(data), rel_path=rel)
 
+    def save_file(self, filename: str, mime: str, data: bytes) -> dict:
+        """A file of any already-vetted type (see orc/deliverables.py), under the same total ceiling.
+        Stored with a neutral extension: nothing in the data directory is named like something that can run."""
+        limit = self.max_total_bytes()
+        used = self.repo.attachments_total_size()
+        if used + len(data) > limit:
+            raise AttachmentError(
+                f"attachments use {used // (1024 * 1024)} MB of {limit // (1024 * 1024)} MB "
+                f"(setting attachments_max_total_mb): no room for a {len(data) // 1024} KB file"
+            )
+        rel = hashlib.sha256(data).hexdigest()[:32] + ".bin"
+        self.root.mkdir(parents=True, exist_ok=True)
+        path = self.root / rel
+        if not path.exists():
+            path.write_bytes(data)
+        return self.repo.add_attachment(filename=filename, mime=mime, size=len(data), rel_path=rel)
+
     def save_base64(self, filename: str, mime: str, data: str) -> dict:
         try:
             raw = base64.b64decode(data, validate=True)

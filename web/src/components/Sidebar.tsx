@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useCallback, useMemo, useState } from "react";
 import {
   DndContext,
   PointerSensor,
@@ -11,20 +11,26 @@ import { CSS } from "@dnd-kit/utilities";
 import {
   Archive,
   BookOpen,
+  ChevronDown,
+  ChevronRight,
   FolderSearch,
   Info,
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  Repeat,
   Settings,
+  Users,
 } from "lucide-react";
-import type { DispatcherStatus, Project, Task, UsageStatus } from "../types";
-import { needsAttention } from "../status";
+import type { Agent, DispatcherStatus, Project, Task, UsageStatus } from "../types";
+import { isAsleep, isRunning, needsAttention } from "../status";
+import { useAgents } from "../agents";
 import { unviewedByProject } from "../viewing";
 import { IconButton } from "../ui/Button";
 import { focusRing } from "../ui/tokens";
 import { Tip } from "../ui/Overlays";
 import { SidebarRow } from "./SidebarRow";
+import { SidebarRunningTasks } from "./SidebarRunningTasks";
 import { UsagePanel } from "./UsagePanel";
 import { DispatcherPanel } from "./DispatcherPanel";
 import { EventsPanel } from "./EventsPanel";
@@ -68,7 +74,13 @@ interface Props {
   /** Open help page ("About" / "How it works") or null for the board. */
   helpPage: HelpPage | null;
   onOpenHelp: (page: HelpPage) => void;
+  /** Open workspace page or null for the board. */
+  workspacePage?: WorkspacePage | null;
+  onOpenWorkspacePage?: (page: WorkspacePage) => void;
 }
+
+/** Pages about the whole orchestrator rather than the selected project. */
+export type WorkspacePage = "agents" | "routines";
 
 /** Manual project order: those with a position by ascending value, followed by never-reordered ones
  * (position=null) by id; a list nobody has touched by hand looks exactly as before. */
@@ -80,19 +92,50 @@ export function byPosition(list: Project[]): Project[] {
   });
 }
 
+const WORKSPACE_ROWS: { page: WorkspacePage; icon: typeof Info; label: string }[] = [
+  { page: "agents", icon: Users, label: "agents.title" },
+  { page: "routines", icon: Repeat, label: "routines.title" },
+];
+
 /** Doors to help at the bottom of the column, in the order in which they are read the first time. */
 const HELP_ROWS: { page: HelpPage; icon: typeof Info; label: string }[] = [
   { page: "guide", icon: BookOpen, label: "pages.nav.guide" },
   { page: "about", icon: Info, label: "pages.nav.about" },
 ];
 
-type Counters = Map<number, { running: number; attention: number; total: number }>;
+const FOLDED_KEY = "orc.sidebar.runningFolded.v1";
+
+/** Projects whose running-cards list the owner folded. Empty by default: the lists are open. */
+function readFolded(): Set<number> {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(FOLDED_KEY) ?? "[]");
+    return new Set(Array.isArray(parsed) ? parsed.filter((v): v is number => Number.isInteger(v)) : []);
+  } catch {
+    // Storage denied or broken JSON: the lists simply stay open.
+    return new Set();
+  }
+}
+
+function writeFolded(folded: Set<number>): void {
+  try {
+    localStorage.setItem(FOLDED_KEY, JSON.stringify([...folded]));
+  } catch {
+    // Out of space or storage denied: the choice then lasts until reload.
+  }
+}
+
+type Counters = Map<number, { running: number; attention: number; asleep: number; total: number }>;
 
 /** One project row in the sidebar: it drags itself (see useSortable), like TaskCard on the board. */
 function SidebarProjectRow({
   project: p,
   counters,
   unviewed,
+  running,
+  agents,
+  runningFolded,
+  onToggleRunningFolded,
+  onOpenTask,
   currentId,
   collapsed,
   onSelect,
@@ -102,20 +145,24 @@ function SidebarProjectRow({
   counters: Counters;
   /** The project's finished results that the owner has not seen yet (viewing.ts). */
   unviewed: number;
+  /** Cards of the project that are in work right now: listed under the row. */
+  running: Task[];
+  agents: readonly Agent[];
+  runningFolded: boolean;
+  onToggleRunningFolded: (projectId: number) => void;
+  onOpenTask: (taskId: number) => void;
   currentId: number | null;
   collapsed: boolean;
   onSelect: (id: number) => void;
   t: TFunction;
 }) {
   const { setNodeRef, transform, transition, isDragging, listeners, attributes } = useSortable({ id: p.id });
-  const c = counters.get(p.id) ?? { running: 0, attention: 0, total: 0 };
+  const c = counters.get(p.id) ?? { running: 0, attention: 0, asleep: 0, total: 0 };
   const selected = p.id === currentId;
   const style = { transform: CSS.Transform.toString(transform), transition };
 
   const row = (
     <button
-      ref={setNodeRef}
-      style={style}
       {...listeners}
       {...attributes}
       onClick={() => onSelect(p.id)}
@@ -127,7 +174,7 @@ function SidebarProjectRow({
         selected
           ? "bg-[color-mix(in_oklab,var(--ink)_10%,transparent)] text-[var(--ink)]"
           : "text-[var(--ink-muted)] hover:bg-[color-mix(in_oklab,var(--ink)_6%,transparent)] hover:text-[var(--ink)]",
-        isDragging ? "z-10 cursor-grabbing opacity-90 shadow-[var(--shadow-pop)]" : "cursor-grab",
+        isDragging ? "cursor-grabbing opacity-90 shadow-[var(--shadow-pop)]" : "cursor-grab",
       )}
     >
       {/* Mark of the selected one: a vertical bar at the edge, not a full fill */}
@@ -149,9 +196,13 @@ function SidebarProjectRow({
           {p.path_ok && c.attention === 0 && c.running > 0 && (
             <span aria-hidden className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-[var(--st-progress)] ring-2 ring-[var(--surface)]" />
           )}
+          {/* A sleeping card is still in work, only without a session: a muted dot, below running work. */}
+          {p.path_ok && c.attention === 0 && c.running === 0 && c.asleep > 0 && (
+            <span aria-hidden className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-[var(--ink-faint)] ring-2 ring-[var(--surface)]" />
+          )}
           {/* An unviewed result is the calmest of the signals: it holds nobody up, so it
              yields the dot both to the call for a human and to running work. */}
-          {p.path_ok && c.attention === 0 && c.running === 0 && unviewed > 0 && (
+          {p.path_ok && c.attention === 0 && c.running === 0 && c.asleep === 0 && unviewed > 0 && (
             <span aria-hidden className="absolute -right-0.5 -top-0.5 h-2 w-2 rounded-full bg-[var(--st-done)] ring-2 ring-[var(--surface)]" />
           )}
         </span>
@@ -160,12 +211,20 @@ function SidebarProjectRow({
           {!p.path_ok && (
             <FolderSearch size={12} className="shrink-0 text-[var(--danger)]" aria-label={t("sidebar.folderUnavailable")} />
           )}
+          {/* Room for the chevron that sits over the row's left edge. */}
+          {running.length > 0 && <span aria-hidden className="w-3 shrink-0" />}
           <span className="truncate text-[13px]">{p.name}</span>
           <span className="ml-auto flex shrink-0 items-center gap-1">
             {c.running > 0 && (
               <span className="tnum flex items-center gap-1 text-[11px] text-[var(--st-progress)]" title={t("sidebar.running", { count: c.running })}>
                 <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-[var(--st-progress)]" />
                 {c.running}
+              </span>
+            )}
+            {c.asleep > 0 && (
+              <span className="tnum flex items-center gap-1 text-[11px] text-[var(--ink-muted)]" title={t("sidebar.asleep", { count: c.asleep })}>
+                <span aria-hidden className="h-1.5 w-1.5 rounded-full bg-[var(--ink-faint)]" />
+                {c.asleep}
               </span>
             )}
             {c.attention > 0 && (
@@ -188,8 +247,30 @@ function SidebarProjectRow({
     </button>
   );
 
+  // The chevron cannot live inside the row button (a button in a button), so it sits over its left
+  // edge as a sibling; the drag handlers are on the row only, so pressing the chevron never drags.
+  const Chevron = runningFolded ? ChevronRight : ChevronDown;
+  const toggle =
+    !collapsed && running.length > 0 ? (
+      <button
+        type="button"
+        onClick={() => onToggleRunningFolded(p.id)}
+        aria-expanded={!runningFolded}
+        aria-label={runningFolded ? t("sidebar.runningShow") : t("sidebar.runningHide")}
+        title={runningFolded ? t("sidebar.runningShow") : t("sidebar.runningHide")}
+        className={cn(
+          "absolute left-1 top-1 flex h-6 w-5 items-center justify-center rounded-[var(--radius-sm)] text-[var(--ink-faint)] hover:text-[var(--ink)]",
+          focusRing,
+        )}
+      >
+        <Chevron size={12} aria-hidden />
+      </button>
+    ) : null;
+
+  // The sortable node is the whole item, not just the button: the running cards under the row must
+  // travel with it while it is dragged.
   return (
-    <li>
+    <li ref={setNodeRef} style={style} className={cn("relative", isDragging && "z-10")}>
       {collapsed ? (
         <Tip
           side="right"
@@ -200,7 +281,20 @@ function SidebarProjectRow({
           {row}
         </Tip>
       ) : (
-        row
+        <div className="relative">
+          {row}
+          {toggle}
+        </div>
+      )}
+      {/* The rail has no room for a list: there the dot on the monogram is the whole signal. */}
+      {!collapsed && (
+        <SidebarRunningTasks
+          tasks={running}
+          agents={agents}
+          folded={runningFolded}
+          onOpenTask={onOpenTask}
+          t={t}
+        />
       )}
     </li>
   );
@@ -242,6 +336,8 @@ export function Sidebar({
   onOpenSettings,
   helpPage,
   onOpenHelp,
+  workspacePage = null,
+  onOpenWorkspacePage,
 }: Props) {
   const { t } = useTranslation();
   // A click on a project must not count as a drag: we activate dragging after a 6px shift (the same
@@ -250,18 +346,42 @@ export function Sidebar({
   // We compute per-project counters once per change of the task list, not in the markup: with ten
   // projects that is a filter on every item on every redraw.
   const counters = useMemo(() => {
-    const map = new Map<number, { running: number; attention: number; total: number }>();
+    const map = new Map<number, { running: number; attention: number; asleep: number; total: number }>();
     for (const t of tasks) {
-      const c = map.get(t.project_id) ?? { running: 0, attention: 0, total: 0 };
+      const c = map.get(t.project_id) ?? { running: 0, attention: 0, asleep: 0, total: 0 };
       c.total += 1;
-      if (t.status === "in_progress" || t.status === "verifying" || t.status === "merging") c.running += 1;
+      if (isRunning(t)) c.running += 1;
       if (needsAttention(t)) c.attention += 1;
+      if (isAsleep(t)) c.asleep += 1;
       map.set(t.project_id, c);
     }
     return map;
   }, [tasks]);
 
   const unviewed = useMemo(() => unviewedByProject(tasks, projects), [tasks, projects]);
+
+  // Cards in work per project, oldest first (the list is ordered by id): a card disappears from here
+  // the moment it stops running, so nothing has to be cleaned up.
+  const runningByProject = useMemo(() => {
+    const map = new Map<number, Task[]>();
+    for (const task of tasks) {
+      if (!isRunning(task)) continue;
+      const list = map.get(task.project_id);
+      if (list) list.push(task);
+      else map.set(task.project_id, [task]);
+    }
+    return map;
+  }, [tasks]);
+  const agents = useAgents();
+  const [foldedRunning, setFoldedRunning] = useState<Set<number>>(readFolded);
+  const toggleRunningFolded = useCallback((projectId: number) => {
+    setFoldedRunning((prev) => {
+      const next = new Set(prev);
+      if (!next.delete(projectId)) next.add(projectId);
+      writeFolded(next);
+      return next;
+    });
+  }, []);
 
   // We split out the archive here, not in App: the column itself decides how to show archived
   // projects. Manual order only for active ones: the archive section is not draggable.
@@ -334,7 +454,21 @@ export function Sidebar({
           <SortableContext items={active.map((p) => p.id)} strategy={verticalListSortingStrategy}>
             <ul className="space-y-0.5">
               {active.map((p) => (
-                <SidebarProjectRow key={p.id} project={p} counters={counters} unviewed={unviewed.get(p.id) ?? 0} currentId={currentId} collapsed={collapsed} onSelect={onSelect} t={t} />
+                <SidebarProjectRow
+                  key={p.id}
+                  project={p}
+                  counters={counters}
+                  unviewed={unviewed.get(p.id) ?? 0}
+                  running={runningByProject.get(p.id) ?? []}
+                  agents={agents}
+                  runningFolded={foldedRunning.has(p.id)}
+                  onToggleRunningFolded={toggleRunningFolded}
+                  onOpenTask={onOpenTask}
+                  currentId={currentId}
+                  collapsed={collapsed}
+                  onSelect={onSelect}
+                  t={t}
+                />
               ))}
             </ul>
           </SortableContext>
@@ -393,6 +527,31 @@ export function Sidebar({
          reads as one column top to bottom. Appearance moved into "Settings": keeping a separate
          button in the column for something changed once in a lifetime is expensive. */}
       <div className={cn("shrink-0 border-t border-[var(--line)] p-1.5", collapsed ? "space-y-1" : "space-y-0.5")}>
+        {WORKSPACE_ROWS.map(({ page, icon, label }) => {
+          const name = t(label);
+          return collapsed ? (
+            <Tip key={page} side="right" text={name}>
+              <IconButton
+                icon={icon}
+                label={name}
+                size="sm"
+                aria-current={workspacePage === page ? "page" : undefined}
+                className={cn("mx-auto flex", workspacePage === page && "bg-[color-mix(in_oklab,var(--ink)_10%,transparent)] text-[var(--ink)]")}
+                onClick={() => onOpenWorkspacePage?.(page)}
+              />
+            </Tip>
+          ) : (
+            <SidebarRow
+              key={page}
+              icon={icon}
+              active={workspacePage === page}
+              aria-current={workspacePage === page ? "page" : undefined}
+              onClick={() => onOpenWorkspacePage?.(page)}
+            >
+              {name}
+            </SidebarRow>
+          );
+        })}
         <EventsPanel open={eventsOpen} onToggle={onEventsOpen} onOpenTask={onOpenTask} collapsed={collapsed} />
         {collapsed ? (
           <Tip side="right" text={t("sidebar.orcSettings")}>

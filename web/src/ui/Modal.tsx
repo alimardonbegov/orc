@@ -4,12 +4,14 @@ import { cn } from "../lib/cn";
 import { IconButton } from "./Button";
 import { useTranslation } from "../i18n";
 
-type Size = "sm" | "md" | "lg" | "xl";
+type Size = "sm" | "md" | "lg" | "card" | "xl";
 
 const WIDTH: Record<Size, string> = {
   sm: "max-w-md",
   md: "max-w-xl",
   lg: "max-w-3xl",
+  // The task card: the thread and the properties column side by side.
+  card: "max-w-5xl",
   // xl — almost the whole screen: for windows where the content is itself a list or a table
   // and needs all the available width (the event feed).
   xl: "max-w-6xl",
@@ -19,6 +21,9 @@ interface Props {
   open: boolean;
   onOpenChange: (open: boolean) => void;
   title: string;
+  /** Replaces the visible heading, for a title edited in place. `title` still names the window for
+   * screen readers. */
+  titleSlot?: React.ReactNode;
   /** Line under the heading: identifiers, branch, status. */
   subtitle?: React.ReactNode;
   /** Buttons in the header to the left of the cross. */
@@ -40,6 +45,8 @@ interface Props {
    * rows must highlight edge to edge and keep their own padding.
    */
   flush?: boolean;
+  /** The scrolling body, for content that follows its own end (a conversation) or pins to its bottom. */
+  bodyRef?: React.Ref<HTMLDivElement>;
   children: React.ReactNode;
 }
 
@@ -52,7 +59,7 @@ interface Props {
  * The header and bottom are pinned, only the content scrolls: in a long task
  * card the "Save"/"Close" buttons must stay in view.
  */
-export function Modal({ open, onOpenChange, title, subtitle, actions, footer, size = "md", sticky, flush, children }: Props) {
+export function Modal({ open, onOpenChange, title, titleSlot, subtitle, actions, footer, size = "md", sticky, flush, bodyRef, children }: Props) {
   const { t } = useTranslation();
   const blockOutside = (e: Event) => {
     if (sticky) e.preventDefault();
@@ -63,17 +70,27 @@ export function Modal({ open, onOpenChange, title, subtitle, actions, footer, si
         <Dialog.Overlay className="orc-anim-fade fixed inset-0 z-40 bg-[rgb(0_0_0/0.55)] backdrop-blur-[2px]" />
         <Dialog.Content
           onInteractOutside={blockOutside}
+          // A title edited in place would take the focus, and the first key pressed would change it
+          onOpenAutoFocus={
+            titleSlot
+              ? (e) => {
+                  e.preventDefault();
+                  (e.currentTarget as HTMLElement).focus();
+                }
+              : undefined
+          }
           className={cn(
             "orc-anim-sheet fixed left-1/2 top-1/2 z-50 flex max-h-[min(88vh,52rem)] w-[calc(100vw-2rem)] -translate-x-1/2 -translate-y-1/2 flex-col",
-            "overflow-hidden rounded-[var(--radius-lg)] border border-[var(--line)] bg-[var(--surface)] shadow-[var(--shadow-pop)]",
+            "overflow-hidden rounded-[var(--radius-lg)] border border-[var(--line)] bg-[var(--surface)] shadow-[var(--shadow-pop)] focus:outline-none",
             WIDTH[size],
           )}
         >
           <header className="flex shrink-0 items-start gap-3 border-b border-[var(--line)] px-5 py-3.5">
             <div className="min-w-0 flex-1">
-              <Dialog.Title className="truncate text-[15px] font-semibold leading-tight text-[var(--ink)]">
+              <Dialog.Title className={titleSlot ? "sr-only" : "truncate text-[15px] font-semibold leading-tight text-[var(--ink)]"}>
                 {title}
               </Dialog.Title>
+              {titleSlot}
               {subtitle && <div className="mt-1 text-[12px] text-[var(--ink-muted)]">{subtitle}</div>}
             </div>
             <div className="flex shrink-0 items-center gap-1.5">
@@ -84,7 +101,7 @@ export function Modal({ open, onOpenChange, title, subtitle, actions, footer, si
             </div>
           </header>
 
-          <div className={cn("min-h-0 flex-1 overflow-y-auto overscroll-contain", !flush && "px-5 py-4")}>{children}</div>
+          <div ref={bodyRef} className={cn("min-h-0 flex-1 overflow-y-auto overscroll-contain", !flush && "px-5 py-4", size === "card" && "[scrollbar-gutter:stable]")}>{children}</div>
 
           {footer && (
             <footer className="flex shrink-0 items-center justify-end gap-2 border-t border-[var(--line)] bg-[var(--sunken)] px-5 py-3">

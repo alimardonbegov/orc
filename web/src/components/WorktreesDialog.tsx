@@ -74,6 +74,7 @@ function WorktreeRow({
       )}
       {item.task_archived && <Badge>{t("worktreesDialog.archived")}</Badge>}
       {item.kind === "foreign" && <Badge>{t("worktreesDialog.foreign")}</Badge>}
+      {item.kind === "chat" && <Badge>{t("worktreesDialog.chat")}</Badge>}
       {item.kind === "merge" && <Badge>{t("worktreesDialog.tempMerge")}</Badge>}
       {item.merged === true && <Badge>{t("worktreesDialog.merged")}</Badge>}
       {item.merged === false && (
@@ -139,7 +140,7 @@ function WorktreeRow({
 /**
  * Project worktrees (.claude/worktrees): how many, whose, how much they weigh and what can be done with them.
  *
- * A task's worktree stays after the merge on purpose — "Rework" relies on it. Here its
+ * A task's worktree is removed after the merge ("Rework" makes it again when needed). Here its
  * cost is visible in bytes, and worktrees can be removed one by one, all merged at once, or all of them.
  * The "allowed / not allowed" rules are computed by the server (orc/worktrees.py) and sent as ready-made text.
  */

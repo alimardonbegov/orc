@@ -296,8 +296,23 @@ def test_blocked_turn_with_fresh_report_goes_to_verify(repo, dispatcher, fake_cl
     t = repo.get_task(t.id)
     assert t.blocker != Blocker.NEEDS_INPUT
     assert t.status != TaskStatus.IN_PROGRESS
-    assert any("ended its turn with a report" in e["message"] for e in repo.list_events())
+    assert any("handed in the work" in e["message"] for e in repo.list_events())
     assert not any("is waiting for reply" in e["message"] for e in repo.list_events())
+
+
+def test_report_with_needs_input_keeps_the_card_waiting(repo, dispatcher, fake_cli, project, tmp_path):
+    # The agent published its questions and stopped: a report in this turn does not make it a handover.
+    t = started(repo, dispatcher, project)
+    transcript = _turn_transcript(tmp_path / "sess.jsonl", time.time() - 3600, "Built it. Four questions are on the page.")
+    report = _write_report(t)
+    report.write_text(json.dumps({"status": "needs_input", "summary": "built", "notes": "questions on the page"}))
+    fake_cli.set_state(t.job_id, "working", tempo="idle", transcript_path=str(transcript))
+    dispatcher.tick()
+    t = repo.get_task(t.id)
+    assert t.status == TaskStatus.IN_PROGRESS
+    assert t.blocker == Blocker.NEEDS_INPUT
+    assert "Four questions" in t.blocker_detail
+    assert not any("handed in the work" in e["message"] for e in repo.list_events())
 
 
 def test_report_turn_with_stuck_queue_counter_goes_to_verify(repo, dispatcher, fake_cli, project, tmp_path):
@@ -312,7 +327,7 @@ def test_report_turn_with_stuck_queue_counter_goes_to_verify(repo, dispatcher, f
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status != TaskStatus.IN_PROGRESS
-    assert any("ended its turn with a report" in e["message"] for e in repo.list_events())
+    assert any("handed in the work" in e["message"] for e in repo.list_events())
 
 
 def test_question_with_stuck_queue_counter_sets_badge(repo, dispatcher, fake_cli, project, tmp_path):
@@ -373,7 +388,7 @@ def test_idle_turn_with_fresh_report_goes_to_verify(repo, dispatcher, fake_cli, 
     t = repo.get_task(t.id)
     assert t.status != TaskStatus.IN_PROGRESS
     assert t.blocker != Blocker.NEEDS_INPUT
-    assert any("ended its turn with a report" in e["message"] for e in repo.list_events())
+    assert any("handed in the work" in e["message"] for e in repo.list_events())
 
 
 def test_idle_turn_without_report_sets_badge_with_agent_text(repo, dispatcher, fake_cli, project, tmp_path):
@@ -396,13 +411,16 @@ def test_idle_turn_with_report_from_previous_turn_sets_badge(repo, dispatcher, f
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.IN_PROGRESS
     assert t.blocker == Blocker.NEEDS_INPUT and t.blocker_detail == "Which port to choose?"
-    assert not any("ended its turn with a report" in e["message"] for e in repo.list_events())
+    assert not any("handed in the work" in e["message"] for e in repo.list_events())
 
 
 def test_idle_session_with_growing_transcript_keeps_working(repo, dispatcher, fake_cli, project, tmp_path):
-    # We still require transcript silence: right after the report is written the turn may still be going
+    # We still require transcript silence while the file does not show the end of the turn: right after the
+    # report is written the agent may be mid-tool-call
     t = started(repo, dispatcher, project)
     transcript = _turn_transcript(tmp_path / "sess.jsonl", time.time() - 3600, "Done.")
+    with transcript.open("a") as f:
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t9", "name": "Bash", "input": {}}]}}) + "\n")
     os.utime(transcript, None)
     _write_report(t)
     fake_cli.set_state(t.job_id, "working", tempo="idle", transcript_path=str(transcript))
@@ -441,7 +459,7 @@ def test_report_turn_with_pending_wakeup_goes_to_verify(repo, dispatcher, fake_c
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status != TaskStatus.IN_PROGRESS
-    assert any("ended its turn with a report" in e["message"] for e in repo.list_events())
+    assert any("handed in the work" in e["message"] for e in repo.list_events())
 
 
 def test_pending_wakeup_without_report_is_not_waiting(repo, dispatcher, fake_cli, project, tmp_path):
@@ -588,7 +606,7 @@ def test_session_settings_carry_input_hooks_with_task_id(repo, dispatcher, fake_
     hooks = settings["hooks"]
     assert "PostToolUse" in hooks and "Stop" in hooks  # inbox is in place
     perm = hooks["PermissionRequest"][0]["hooks"][0]
-    secret_file = Path(t.worktree_path) / ".orchestrator" / "hook-secret"
+    secret_file = inputs.hook_secret_path(dispatcher.settings.data_dir, t.id)
     assert perm["command"].endswith(
         f"input_hook.py --api {dispatcher.settings.api_base} --task {t.id} --secret-file {shlex.quote(str(secret_file))}")
     assert perm["timeout"] == inputs.HOOK_TIMEOUT_SEC
@@ -760,9 +778,9 @@ def test_hook_kind_detection_matches_orc():
 
 # ---------- hooks survive a resume ----------
 
-def test_resume_of_finished_session_passes_hooks_again(repo, dispatcher, fake_cli, project):
-    # A done/failed session is still "running" for the daemon: a resume creates a copy without the saved
-    # options, and the hooks would have to be handed out again. A stopped one is woken by the daemon itself.
+def test_every_resume_passes_hooks_again(repo, dispatcher, fake_cli, project):
+    # Without flags a resume inside the daemon's settle window is a copy with no options at all, so the
+    # hooks go out with every resume, a stopped session included.
     t = started(repo, dispatcher, project)
     fake_cli.set_state(t.job_id, "failed", detail="TypeError")
     dispatcher.tick()
@@ -773,4 +791,55 @@ def test_resume_of_finished_session_passes_hooks_again(repo, dispatcher, fake_cl
     fake_cli.stop_marks_stopped = True
     dispatcher.answer(t.id, "stop", mode="interrupt")
     call = [c for c in fake_cli.calls if c[0] == "resume_bg"][-1]
-    assert call[3] == "stop" and call[4] is None
+    assert call[3] == "stop" and "PermissionRequest" in call[4]
+
+
+# ---------- explicit handoff does not wait for the quiet period ----------
+
+def _fresh_turn(path: Path, final_text: str) -> Path:
+    """A turn that ended just now: the transcript has been written a second ago."""
+    _turn_transcript(path, time.time() - 600, final_text)
+    os.utime(path, None)
+    return path
+
+
+def test_handed_in_turn_goes_to_verify_on_first_tick_after_turn_ends(repo, dispatcher, fake_cli, project, tmp_path):
+    t = started(repo, dispatcher, project)
+    transcript = _fresh_turn(tmp_path / "sess.jsonl", "Done, everything is committed.")
+    _write_report(t)
+    fake_cli.set_state(t.job_id, "working", tempo="idle", transcript_path=str(transcript))
+    dispatcher.tick()
+    assert repo.get_task(t.id).status != TaskStatus.IN_PROGRESS  # no verify_cmd: verifying passes at once
+    assert any("handed in the work" in e["message"] for e in repo.list_events())
+
+
+def test_turn_without_handoff_still_waits_for_quiet_period(repo, dispatcher, fake_cli, project, tmp_path):
+    t = started(repo, dispatcher, project)
+    transcript = _fresh_turn(tmp_path / "sess.jsonl", "Which port to choose?")
+    fake_cli.set_state(t.job_id, "working", tempo="idle", transcript_path=str(transcript))
+    dispatcher.tick()
+    t = repo.get_task(t.id)
+    assert t.status == TaskStatus.IN_PROGRESS and t.blocker is None
+    _age(transcript)
+    dispatcher.tick()
+    assert repo.get_task(t.id).blocker == Blocker.NEEDS_INPUT
+
+
+def test_handoff_waits_while_transcript_does_not_show_turn_end(repo, dispatcher, fake_cli, project, tmp_path):
+    t = started(repo, dispatcher, project)
+    transcript = _fresh_turn(tmp_path / "sess.jsonl", "Done.")
+    with transcript.open("a") as f:  # the agent went on with a tool call after the handoff
+        f.write(json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use", "id": "t2", "name": "Bash", "input": {}}]}}) + "\n")
+    _write_report(t)
+    fake_cli.set_state(t.job_id, "working", tempo="idle", transcript_path=str(transcript))
+    dispatcher.tick()
+    assert repo.get_task(t.id).status == TaskStatus.IN_PROGRESS
+
+
+def test_handoff_waits_for_background_work(repo, dispatcher, fake_cli, project, tmp_path):
+    t = started(repo, dispatcher, project)
+    transcript = _fresh_turn(tmp_path / "sess.jsonl", "Done.")
+    _write_report(t)
+    fake_cli.set_state(t.job_id, "working", tempo="idle", transcript_path=str(transcript), in_flight=1)
+    dispatcher.tick()
+    assert repo.get_task(t.id).status == TaskStatus.IN_PROGRESS

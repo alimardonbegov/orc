@@ -1,47 +1,54 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { toast } from "sonner";
 import {
   Archive,
   ArchiveRestore,
-  Check,
   CheckCircle2,
   Clock,
-  Copy,
-  FileText,
-  FolderGit2,
-  GitBranch,
-  MessageSquarePlus,
-  OctagonPause,
-  Pencil,
   PlayCircle,
-  RotateCcw,
-  Send,
-  ShieldCheck,
-  Terminal,
   Trash2,
 } from "lucide-react";
-import { api } from "../api";
-import type { Project, Task, TaskDetail } from "../types";
+import { api, type TaskBody } from "../api";
+import { useAgents } from "../agents";
+import { effectiveCardSettings, useAppCardSettings } from "../cardSettings";
+import { useAutosave } from "../hooks/useAutosave";
+import { labelsByName, useLabels } from "../hooks/useLabels";
+import { modelLabel } from "../models";
+import { permissionLabel } from "../permissions";
+import { composerMode, nowFromTask } from "../activity";
+import { quickActionSender, resolveQuickActions } from "../quickActions";
+import { QuickActionsSection } from "./QuickActionsSection";
+import type { ActivityNow, Agent, Project, Task, TaskDetail } from "../types";
+import { ActivityPanel } from "./ActivityPanel";
+import { AgentStatusChip } from "./AgentStatusChip";
+import { BaseMismatchNotice, baseMismatch, useProjectBranches } from "./cardProperties/BranchProperty";
+import { PropertyRows } from "./cardProperties/CardProperties";
+import type { CardPropertyValues } from "./cardProperties/types";
 import { DescriptionEditor } from "./DescriptionEditor";
+import { rawOffsetForView, visibleOffsetAt } from "../lib/caret";
 import { DescriptionView } from "./DescriptionView";
-import { EmptyDescriptionDialog } from "./EmptyDescriptionDialog";
-import { InputRequestPanel } from "./InputRequestPanel";
-import { TaskForm, type TaskFormValues } from "./TaskForm";
-import { TaskTimeline } from "./TaskTimeline";
-import { UsageSection } from "./UsageSection";
-import { blockerLabel, priorityLabel, statusLabel, waitingLabel } from "../labels";
-import { BLOCKER_META, STATUS_META, hasDescription } from "../status";
+import { NotReadyDialog } from "./NotReadyDialog";
+import { CardDetails } from "./CardDetails";
+import { DeliverablesSection } from "./DeliverablesSection";
+import { ProgressPill, RelationsSection } from "./RelationsSection";
+import { progressOf, subtasksOf } from "../relations";
+import { ExecutionLog } from "./ExecutionLog";
+import { WakeupsSection } from "./WakeupsSection";
+import { blockerLabel, statusLabel, waitingLabel } from "../labels";
+import { BLOCKER_META, STATUS_META, workIssues } from "../status";
 import { isUnviewed, tracksViewed } from "../viewing";
 import { Badge } from "../ui/Badge";
-import { Button, IconButton } from "../ui/Button";
+import { Button } from "../ui/Button";
 import { Confirm } from "../ui/Confirm";
-import { Checkbox, Select } from "../ui/Field";
+import { AutoGrowTextarea, Checkbox } from "../ui/Field";
 import { Modal } from "../ui/Modal";
 import { cn } from "../lib/cn";
+import { focusRing, textBox, textBoxBleed } from "../ui/tokens";
 import { parseUsage } from "../usage";
 import { formatDuration } from "../dates";
 import { scheduleState, windowTime } from "../schedule";
 import { useNow } from "../hooks/useNow";
-import { useTranslation, type TFunction } from "../i18n";
+import { useTranslation } from "../i18n";
 
 interface Props {
   taskId: number;
@@ -49,143 +56,227 @@ interface Props {
   /** All projects: from them, by task.project_id, the task's project is taken; its settings are
    * shown in the run parameters as inherited values. */
   projects?: Project[];
-  /** Open the card straight in the editor: this is how it is opened "for repair" of an empty
-   * description. */
-  initialEditing?: boolean;
+  /** Open with this field ready to fill: this is how a card refused from the board is opened. "thread"
+   * opens at the end of the conversation: the owner came from "Waiting for me" to answer. */
+  focusOn?: "description" | "agent" | "thread" | null;
   /** Go to another task right from the dialog, via the "after #N" badge. Without a handler the
    * badge stays a plain label. */
   onOpenTask?: (id: number) => void;
+  /** Open the creation form for a subtask of this card, prefilled from it. Without a handler there is no "+". */
+  onCreateSubtask?: (parent: Task) => void;
   onClose: () => void;
   onChanged: () => void;
 }
 
-function authorLabel(t: TFunction, author: string): string {
-  return author === "user" || author === "orc" || author === "claude" ? t(`taskModal.author.${author}`) : author;
-}
-
-/** Label of a conversation turn: for the archived report a separate label, not "agent", so as not
- * to confuse it with a fresh message from it. */
-function commentLabel(t: TFunction, c: TaskDetail["comments"][number]): string {
-  if (c.kind === "report") return t("taskModal.reportArchivedLabel");
-  if (c.kind === "answer") return t("taskModal.answerAuthor");
-  return authorLabel(t, c.author);
-}
-
-/** Machine string with a copy button: branches, paths and commands are copied more often than read. */
-function CopyRow({ icon: Icon, label, value }: { icon: typeof GitBranch; label: string; value: string }) {
+/** "Subtask of #N, x/y" above the title, after multica's parent link. A parent off the board stays a number. */
+function ParentLink({ parentId, allTasks, onOpenTask }: { parentId: number; allTasks: Task[]; onOpenTask?: (id: number) => void }) {
   const { t } = useTranslation();
-  const [copied, setCopied] = useState(false);
+  const parent = allTasks.find((other) => other.id === parentId);
+  const progress = progressOf(subtasksOf(parentId, allTasks));
+  const content = (
+    <>
+      <span className="shrink-0">{t("card.relations.subtaskOf")}</span>
+      <span className="tnum shrink-0 font-mono">#{parentId}</span>
+      {parent && <span className="truncate">{parent.title}</span>}
+      {progress.total > 0 && <ProgressPill {...progress} />}
+    </>
+  );
+  const className = "mb-1 flex max-w-full items-center gap-1.5 text-[11.5px] text-[var(--ink-muted)]";
+  return parent && onOpenTask ? (
+    <button
+      type="button"
+      aria-label={`${t("card.relations.subtaskOf")} #${parentId} ${parent.title}`}
+      onClick={() => onOpenTask(parentId)}
+      className={cn(className, "rounded hover:text-[var(--ink)]", focusRing)}
+    >
+      {content}
+    </button>
+  ) : (
+    <p className={className}>{content}</p>
+  );
+}
+
+/**
+ * What a session of this card runs with. The card holds no parameters of its own: they follow the agent
+ * it is tied to, and the project where the agent leaves a value empty (orc/agents.py). So this is one
+ * quiet line with no controls: to run the card differently, pick another agent.
+ */
+function RunSummary({ agent, project }: { agent: Agent | undefined; project: Project | undefined }) {
+  const { t } = useTranslation();
+  const model = agent?.model || project?.default_model;
+  const effort = agent?.effort || project?.default_effort;
+  const mode = agent?.permission_mode || project?.default_permission_mode;
+  const parts = [model && modelLabel(model), effort, mode && permissionLabel(mode)].filter(Boolean);
+  if (parts.length === 0) return null;
   return (
-    <div className="flex min-w-0 items-center gap-2 py-1">
-      <Icon size={12} className="shrink-0 text-[var(--ink-faint)]" aria-hidden />
-      <span className="w-24 shrink-0 text-[11px] text-[var(--ink-faint)]">{label}</span>
-      <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--ink-muted)]" title={value}>
-        {value}
-      </code>
-      <IconButton
-        icon={copied ? Check : Copy}
-        label={copied ? t("taskModal.copied") : t("taskModal.copyLabel", { label })}
-        size="sm"
-        onClick={() => {
-          void navigator.clipboard?.writeText(value).then(
-            () => {
-              setCopied(true);
-              setTimeout(() => setCopied(false), 1500);
-            },
-            () => {
-              // Clipboard unavailable (no https, permission denied): the string is still visible
-              // and can be selected.
-            },
-          );
-        }}
-      />
+    <div className="px-1.5 text-[11px] leading-snug text-[var(--ink-faint)]" title={t("card.modal.runsWithHint")}>
+      <p>{t("card.modal.runsWith", { params: parts.join(" · ") })}</p>
     </div>
   );
 }
 
 /**
- * Task base branch: its working branch is branched from it and the result will go into it.
- *
- * A separate row, not only a badge in the header: the branch name used to stand without a label,
- * and it was impossible to tell from it what branch it is at all and where to change it.
+ * A deferred start, as a property: when the dispatcher will take the task, and how to undo that. "Start now"
+ * only removes the schedule, after which the task goes through the shared queue.
  */
-function TargetBranchRow({
-  task,
-  editable,
-  pending,
-  onChange,
-}: {
-  task: TaskDetail;
-  /** The base can be changed only while the worktree has not been created yet (backlog / to do /
-   * failed). */
-  editable: boolean;
+function StartRow({ sched, task, now, pending, onClear }: {
+  sched: NonNullable<ReturnType<typeof scheduleState>>;
+  task: Task;
+  now: number;
   pending: boolean;
-  onChange: (branch: string) => void;
+  onClear: () => void;
+}) {
+  const { t, language } = useTranslation();
+  const text =
+    sched.kind === "missed"
+      ? t("taskModal.schedule.missed")
+      : task.status !== "todo"
+        ? // The dispatcher does not take a task from backlog or failed: the deadline takes effect only after "To do"
+          t("taskModal.schedule.notQueued", {
+            time: windowTime(sched.kind === "waiting" ? sched.at : Date.parse(task.start_after ?? "") || sched.until, language, now),
+          })
+        : sched.kind === "waiting"
+          ? t("taskModal.schedule.waiting", { duration: formatDuration(t, sched.at - now) })
+          : t("taskModal.schedule.window", { time: windowTime(sched.until, language, now) });
+  const startNow = sched.kind === "waiting" && task.status === "todo";
+  return (
+    <div data-testid="start-row" className="grid grid-cols-[5.5rem_minmax(0,1fr)] items-start gap-1 px-1.5">
+      <span className="flex items-center gap-1 pt-0.5 text-[11px] text-[var(--ink-faint)]">
+        <Clock size={11} aria-hidden />
+        {t("taskModal.schedule.label")}
+      </span>
+      <div className="min-w-0 space-y-1">
+        <p className="text-[12px] leading-snug text-[var(--ink-muted)]">{text}</p>
+        <Button size="sm" variant={startNow ? "primary" : "ghost"} icon={startNow ? PlayCircle : undefined} disabled={pending} onClick={onClear}>
+          {startNow ? t("taskModal.schedule.startNow") : t("taskModal.schedule.clear")}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The description, edited in place: a click on the text turns it into the field, a click anywhere
+ * else turns it back, and saving is the autosave's business. There is no edit mode to enter or leave.
+ *
+ * It ends on a pointer press outside rather than on blur: picking an image opens a system dialog,
+ * which takes the focus away while the person is still editing.
+ */
+function InlineDescription({ value, onChange, onCommit, editable, editing, onEditingChange }: {
+  value: string;
+  onChange: (next: string) => void;
+  onCommit: () => void;
+  editable: boolean;
+  editing: boolean;
+  onEditingChange: (editing: boolean) => void;
 }) {
   const { t } = useTranslation();
-  const [branches, setBranches] = useState<string[]>([]);
-  useEffect(() => {
-    if (!editable) return;
-    let alive = true;
-    api
-      .branches(task.project_id)
-      .then((b) => alive && setBranches(b.branches))
-      .catch(() => alive && setBranches([]));
-    return () => {
-      alive = false;
-    };
-  }, [editable, task.project_id]);
+  const box = useRef<HTMLDivElement>(null);
+  const view = useRef<HTMLDivElement>(null);
+  // What the view knew at the click: how tall it was and which place of the text was hit. The field
+  // opens with the same height and the caret there, so nothing on the screen shifts.
+  const [entry, setEntry] = useState<{ caret?: number; minHeight?: number }>({});
 
-  const value = task.target_branch ?? "";
-  return (
-    <div className="py-1">
-      <div className="flex min-w-0 items-center gap-2">
-        <GitBranch size={12} className="shrink-0 text-[var(--ink-faint)]" aria-hidden />
-        <span className="w-24 shrink-0 text-[11px] text-[var(--ink-faint)]">{t("taskModal.baseBranchRowLabel")}</span>
-        {editable ? (
-          <Select
-            aria-label={t("taskForm.baseBranchLabel")}
-            className="h-7 max-w-56 font-mono text-[11px]"
-            value={value}
-            disabled={pending}
-            onChange={(e) => e.target.value !== value && onChange(e.target.value)}
-          >
-            {value && !branches.includes(value) && <option value={value}>{t("taskForm.branchGone", { branch: value })}</option>}
-            {branches.map((b) => (
-              <option key={b} value={b}>
-                {b}
-              </option>
-            ))}
-          </Select>
-        ) : (
-          <code className="min-w-0 flex-1 truncate font-mono text-[11px] text-[var(--ink-muted)]">{value || "—"}</code>
-        )}
+  useEffect(() => {
+    if (!editing) return;
+    const onPointerDown = (e: PointerEvent) => {
+      if (box.current && !box.current.contains(e.target as Node)) {
+        onCommit();
+        onEditingChange(false);
+      }
+    };
+    document.addEventListener("pointerdown", onPointerDown);
+    return () => document.removeEventListener("pointerdown", onPointerDown);
+  }, [editing, onCommit, onEditingChange]);
+
+  /** Enter edit mode from the view, taking its height and, for a click, the place that was hit. */
+  function openEditor(point?: { x: number; y: number }) {
+    const el = view.current;
+    const visible = el && point ? visibleOffsetAt(el, point.x, point.y) : null;
+    setEntry({
+      minHeight: el?.getBoundingClientRect().height,
+      caret: visible === null ? undefined : rawOffsetForView(value, visible),
+    });
+    onEditingChange(true);
+  }
+
+  if (editable && editing) {
+    return (
+      <div ref={box} onBlur={onCommit} className="[overflow-anchor:none]">
+        <DescriptionEditor
+          label={t("taskForm.descriptionLabel")}
+          placeholder={t("taskForm.descriptionPlaceholder")}
+          value={value}
+          onChange={onChange}
+          autoFocus
+          bleed
+          initialCaret={entry.caret}
+          minHeight={entry.minHeight}
+          textareaClassName="min-h-0"
+        />
       </div>
-      <p className="mt-0.5 pl-[7.5rem] text-[11px] leading-snug text-[var(--ink-faint)]">
-        {editable ? t("taskModal.baseBranchHintEditable") : t("taskModal.baseBranchHintLocked")}
-      </p>
+    );
+  }
+  // The view and the field are one box: the same border (here invisible), padding and type, so the
+  // first line of text stays where it was when the field opens.
+  const viewBox = cn(textBox, textBoxBleed, "min-h-0 rounded-[var(--radius-sm)] border-transparent");
+  if (!editable) {
+    return value ? (
+      <DescriptionView text={value} className={viewBox} />
+    ) : (
+      <p className={cn(viewBox, "text-[12px] text-[var(--ink-faint)]")}>{t("taskModal.noDescription")}</p>
+    );
+  }
+  return (
+    <div
+      ref={view}
+      role="button"
+      tabIndex={0}
+      aria-label={t("card.modal.editDescription")}
+      onClick={(e) => {
+        // A link or a picture in the text does its own job, and selecting text to copy it is not a wish to edit
+        if ((e.target as Element).closest("a,button,img") || window.getSelection()?.toString()) return;
+        openEditor({ x: e.clientX, y: e.clientY });
+      }}
+      onKeyDown={(e) => {
+        if (e.target === e.currentTarget && (e.key === "Enter" || e.key === " ")) {
+          e.preventDefault();
+          openEditor();
+        }
+      }}
+      className={cn(viewBox, "cursor-text transition-colors duration-100 hover:bg-[color-mix(in_oklab,var(--ink)_5%,transparent)]", focusRing)}
+    >
+      {value ? <DescriptionView text={value} plain /> : <span className="text-[13px] text-[var(--ink-faint)]">{t("card.modal.emptyDescription")}</span>}
     </div>
   );
 }
 
 /**
- * The whole task card: description, blockers, report, technical lines and conversation.
+ * The whole task card: what to do on the left with the thread under it, what it is on the right. Nothing
+ * here needs an edit mode. The title and the description are edited where they are written, the
+ * properties where they are shown, and everything saves itself.
  *
- * The order of blocks is subordinated to a single question: "do I need to do something". So the
- * "agent is waiting for a reply" block stands above the description: when it is there, there is no
- * need to read anything else.
+ * The card describes the work once. Everything between the owner and the agent happens in the thread
+ * under the description: a question, a request, a failure, and the one composer pinned to the bottom of the
+ * column. Nothing about the conversation sits above the task.
  */
-export function TaskModal({ taskId, allTasks, projects, initialEditing = false, onOpenTask, onClose, onChanged }: Props) {
-  const { t, language } = useTranslation();
+export function TaskModal({ taskId, allTasks, projects, focusOn = null, onOpenTask, onCreateSubtask, onClose, onChanged }: Props) {
+  const { t } = useTranslation();
   // The hook goes before the early return "task is still loading" (rules of hooks).
   const now = useNow();
   const [task, setTask] = useState<TaskDetail | null>(null);
-  const [editing, setEditing] = useState(initialEditing);
-  // An attempt to send a card without a description to work: we show a dialog instead of the
-  // request.
-  const [emptyDesc, setEmptyDesc] = useState(false);
-  const [answer, setAnswer] = useState("");
-  const [note, setNote] = useState("");
+  const { labels: knownLabels } = useLabels();
+  // An attempt to send an unready card to work: we show a dialog with the fix instead of the request.
+  const [notReady, setNotReady] = useState(false);
+  const [editingDescription, setEditingDescription] = useState(focusOn === "description");
+  const [openProperty, setOpenProperty] = useState<string | null>(focusOn === "agent" ? "agent" : null);
+  const [saveState, setSaveState] = useState<"saving" | "saved" | null>(null);
+  const [activityNow, setActivityNow] = useState<ActivityNow | null>(null);
+  // The card's scrolling body: the thread follows its end there, and the composer pins to its bottom.
+  const [body, setBody] = useState<HTMLDivElement | null>(null);
+  const jumpToEnd = useRef<(() => void) | null>(null);
+  // Text typed in the composer, or a command of it in flight: a stray click must not close the card.
+  const [composerBusy, setComposerBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
   const [closing, setClosing] = useState(false);
@@ -195,14 +286,68 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
   // will remember later. Unchecked when the work in the branch is to be sorted out by hand.
   const [dropWorktree, setDropWorktree] = useState(true);
 
-  const load = useCallback(
-    () =>
-      api
-        .getTask(taskId)
-        .then(setTask)
-        .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e))),
-    [taskId],
+  const activitySource = useMemo(() => ({ kind: "task" as const, id: taskId }), [taskId]);
+
+  // Bumped by every edit: a read that started before it answers with the old card and must not win.
+  const edits = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
+
+  const load = useCallback(() => {
+    const seen = edits.current;
+    return api
+      .getTask(taskId)
+      .then((fresh) => {
+        if (seen === edits.current) setTask(fresh);
+      })
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : String(e)));
+  }, [taskId]);
+
+  /** One edit of the card, saved at once. Throws on failure: the autosave keeps the text as unsaved. */
+  const save = useCallback(
+    async (fields: Omit<TaskBody, "blocker">) => {
+      setError(null);
+      setSaveState("saving");
+      edits.current += 1;
+      try {
+        const fresh = await api.patchTask(taskId, fields);
+        edits.current += 1;
+        setTask(fresh);
+        setSaveState("saved");
+        onChanged();
+      } catch (e) {
+        setSaveState(null);
+        const message = e instanceof Error ? e.message : String(e);
+        // The card may be closed by now, with the text typed into it: this must not pass silently
+        if (mounted.current) setError(message);
+        else toast.error(t("card.modal.saveFailed", { error: message }));
+        throw e;
+      }
+    },
+    [taskId, onChanged, t],
   );
+
+  /** A property changed in the card: shown at once, and on a refusal the card is read back. */
+  const changeProperties = (patch: Partial<CardPropertyValues>) => {
+    // The card holds label objects, the request carries names: show the new ones at once, with their colours
+    const { labels: names, ...rest } = patch;
+    setTask((current) => (current ? { ...current, ...rest, ...(names ? { labels: labelsByName(names, knownLabels) } : {}) } : current));
+    save(patch).catch(() => void load());
+  };
+
+  const title = useAutosave({
+    value: task?.title ?? "",
+    save: (next) => save({ title: next.trim() }),
+    valid: (next) => next.trim() !== "",
+  });
+  const description = useAutosave({ value: task?.description ?? "", save: (next) => save({ description: next }) });
+  const flushDescription = description.flush;
+  const commitDescription = useCallback(() => void flushDescription(), [flushDescription]);
   // The card lives long, and the task under it changes without us: the agent asked a question,
   // requested permission, the dispatcher removed the badge. The board sees this by polling, and its
   // snapshot of the task is a signal to re-read the details, otherwise the open dialog would show a
@@ -219,6 +364,12 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
   // closed while the dialog was already open stays unviewed: nobody has read its report yet. The
   // project may not exist yet (the list loads after F5): then we wait for it without deciding.
   const project = task ? projects?.find((p) => p.id === task.project_id) : undefined;
+  const appCardSettings = useAppCardSettings();
+  const cardSettings = effectiveCardSettings(project, appCardSettings);
+  const agent = useAgents().find((a) => a.id === task?.agent_id);
+  // Only while the base can still change (TARGET_BRANCH_EDITABLE in orc/api/common.py)
+  const beforeWork = task?.status === "backlog" || task?.status === "todo" || task?.status === "failed";
+  const branches = useProjectBranches(task?.project_id ?? 0, beforeWork);
   const autoViewed = useRef(false);
   useEffect(() => {
     if (!task || !project || autoViewed.current) return;
@@ -255,6 +406,9 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
     }
   }
 
+  // The card's own idea of the session, until the feed answers: the composer must not wait for a poll
+  const fallbackNow = useMemo(() => (task ? nowFromTask(task) : null), [task]);
+
   const change = (open: boolean) => {
     if (!open) onClose();
   };
@@ -278,7 +432,7 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
 
   if (!task) {
     return (
-      <Modal open onOpenChange={change} title={t("taskModal.loadingTitle")} size="lg">
+      <Modal open onOpenChange={change} title={t("taskModal.loadingTitle")} titleSlot={<span className="block h-[18px]" />} size="card">
         <p className="py-8 text-center text-[12px] text-[var(--ink-muted)]">{error ?? t("common.loading")}</p>
       </Modal>
     );
@@ -287,29 +441,41 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
   const meta = STATUS_META[task.status];
   const StatusIcon = meta.icon;
   const blockerMeta = task.blocker ? BLOCKER_META[task.blocker] : null;
-  // A note stays a note, but the same text can be sent to Claude. For a running task this is answer
-  // (stop + resume of the same session), for a finished one it is rework, which returns the card to
-  // "To do" and continues the previous session. A task under quota is not touched: the dispatcher
-  // will resume it itself on schedule. The field may not come from an old server: the card must not
-  // crash because of that.
-  const outbox = task.outbox ?? [];
-  const sendKind: "answer" | "rework" | null =
-    task.status === "in_progress" && task.blocker !== "quota" ? "answer" : task.status === "done" ? "rework" : null;
-  const report = task.report_json ? (JSON.parse(task.report_json) as { summary: string; notes: string }) : null;
   const usage = parseUsage(task.usage_json);
-  // A failed task is also allowed to be edited: its rerun builds the prompt anew, and if it stopped
-  // because of an empty description, there is nowhere else to add it (the same status list as for
-  // the base branch below).
-  const editable = (task.status === "backlog" || task.status === "todo" || task.status === "failed") && !editing;
-  // The base can be changed for a failed task too: its rerun will create the worktree anew (the
-  // same list as TARGET_BRANCH_EDITABLE in orc/api.py).
-  const branchEditable = task.status === "backlog" || task.status === "todo" || task.status === "failed";
   // Emergency exit from work is the same as dragging the card into "Done" (Board.tsx). The button
   // is needed here because a stuck task is first opened and read, not dragged: there is no way to
   // learn about the mouse move while looking at a motionless card.
   const stuck = task.status === "in_progress" || task.status === "verifying" || task.status === "merging";
   const archived = Boolean(task.archived_at);
+  // The same state the composer reads, so a quick action from the panel and one from "/" take the same road
+  const quickNow = activityNow ?? fallbackNow;
+  const quickActions = resolveQuickActions(cardSettings, t);
+  const quickSend = quickNow ? quickActionSender(composerMode("task", quickNow, archived), quickNow, task.id) : null;
   const sched = scheduleState(task, now);
+  const propertyValues: CardPropertyValues = {
+    agent_id: task.agent_id ?? null,
+    priority: task.priority,
+    target_branch: task.target_branch,
+    depends_on: task.depends_on,
+    labels: (task.labels ?? []).map((l) => l.name),
+    start_date: task.start_date ?? null,
+    due_date: task.due_date ?? null,
+  };
+  const mismatch = baseMismatch(allTasks, task.depends_on, task.project_id, task.target_branch);
+  const issues = workIssues({ agent_id: task.agent_id, routine_id: task.routine_id, description: description.draft });
+
+  /** Sending to work: an unready card gets a dialog with the fix, otherwise the server would refuse. */
+  const toWork = (action: () => Promise<unknown>) => {
+    if (issues.length > 0) {
+      setNotReady(true);
+      return;
+    }
+    // The status goes after the text: the server checks the description the card holds at that moment
+    void run(async () => {
+      await description.flush();
+      await action();
+    });
+  };
   // Who waits for this task: after deletion the link disappears, and those cards will go on their
   // own.
   const dependents = allTasks.filter((t) => t.id !== task.id && t.depends_on.includes(task.id));
@@ -319,9 +485,33 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
       <Modal
         open
         onOpenChange={change}
-        size="lg"
-        sticky={editing || pending}
+        size="card"
+        flush
+        sticky={pending || composerBusy}
+        bodyRef={setBody}
         title={task.title}
+        titleSlot={
+          <>
+          {task.parent_task_id != null && <ParentLink parentId={task.parent_task_id} allTasks={allTasks} onOpenTask={onOpenTask} />}
+          <AutoGrowTextarea
+            aria-label={t("taskForm.titleLabel")}
+            readOnly={archived}
+            value={title.draft}
+            // A title is one paragraph that wraps instead of being cut off, and it has no line breaks
+            onChange={(e) => title.change(e.target.value.replace(/\s*\n\s*/g, " "))}
+            onBlur={() => (title.draft.trim() === "" ? title.revert() : void title.flush())}
+            onKeyDown={(e) => {
+              // Enter must not reach anything else: a title has no second line, and pressing it means "done"
+              if (e.key === "Enter") {
+                e.preventDefault();
+                e.currentTarget.blur();
+              }
+            }}
+            wrapperClassName="-mx-1"
+            className="min-h-0 rounded-[var(--radius-sm)] border-0 bg-transparent px-1 py-0 text-[15px] font-semibold leading-tight text-[var(--ink)] hover:bg-transparent read-only:cursor-default not-read-only:hover:bg-[color-mix(in_oklab,var(--ink)_5%,transparent)] focus:bg-[var(--sunken)] focus:ring-0"
+          />
+          </>
+        }
         subtitle={
           <div className="flex flex-wrap items-center gap-1.5">
             <span className="tnum font-mono text-[11px] text-[var(--ink-faint)]">#{task.id}</span>
@@ -334,36 +524,30 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
                 {task.blocker === "needs_input" ? waitingLabel(t, task) : blockerLabel(t, task.blocker)}
               </Badge>
             )}
-            {task.priority !== "normal" && <Badge>{t("taskModal.priorityBadge", { priority: priorityLabel(t, task.priority) })}</Badge>}
-            {task.target_branch && (
-              <Badge icon={GitBranch} mono title={t("taskCard.branchTitle", { branch: task.target_branch })}>
-                {task.target_branch}
+            {/* The card that created this one may be gone by now: the mark stays, the link does not. When it is also
+               the parent, the link above the title already says it. */}
+            {task.created_by_task_id != null && task.created_by_task_id !== task.parent_task_id && (
+              <Badge
+                mono
+                title={t("taskModal.openDepTitle", { id: task.created_by_task_id })}
+                onClick={onOpenTask && allTasks.some((other) => other.id === task.created_by_task_id) ? () => onOpenTask(task.created_by_task_id as number) : undefined}
+              >
+                {t("taskModal.createdBy", { id: task.created_by_task_id })}
               </Badge>
             )}
-            {/* The blocker badge leads to the blocking task itself: the question "what are
-               we waiting for?" is most often asked right from here. A blocker from another
-               repository is labelled with its project, otherwise someone else's "#12" cannot be
-               told apart from your own. */}
-            {task.depends_on.map((d) => {
-              const dep = allTasks.find((task2) => task2.id === d);
-              const foreign = dep && dep.project_id !== task.project_id ? projects?.find((p) => p.id === dep.project_id) : null;
-              return (
-                <Badge
-                  key={d}
-                  mono
-                  title={foreign ? t("taskModal.openDepTitleForeign", { id: d, project: foreign.name }) : t("taskModal.openDepTitle", { id: d })}
-                  label={foreign ? t("taskModal.dependsOnForeignLabel", { id: d, project: foreign.name }) : undefined}
-                  onClick={onOpenTask ? () => onOpenTask(d) : undefined}
-                >
-                  {t("taskCard.dependsOn", { id: d })}
-                  {foreign && <span className="ml-1 font-sans text-[var(--ink-faint)]">· {foreign.name}</span>}
-                </Badge>
-              );
-            })}
+            {saveState && (
+              <span aria-live="polite" className="text-[11px] text-[var(--ink-faint)]">
+                {saveState === "saving" ? t("card.modal.saving") : t("card.modal.saved")}
+              </span>
+            )}
           </div>
         }
         actions={
           <>
+            {/* The chip says what the agent is doing; a click goes to where it is said, the end of the thread. */}
+            <button type="button" aria-label={t("card.modal.toThreadEnd")} className={cn("rounded-full", focusRing)} onClick={() => jumpToEnd.current?.()}>
+              <AgentStatusChip task={task} now={activityNow} />
+            </button>
             {/* The viewing check mark is only on a finished task and only where viewing is
                tracked. It is also the way to return the task to unviewed, to deal with it
                later. */}
@@ -383,390 +567,143 @@ export function TaskModal({ taskId, allTasks, projects, initialEditing = false, 
                 {t("viewing.viewed")}
               </label>
             )}
-            {editable && <IconButton icon={Pencil} label={t("common.edit")} size="sm" onClick={() => setEditing(true)} />}
           </>
         }
       >
-        <div className="space-y-4">
+        <div className="grid min-h-full md:grid-cols-[minmax(0,1fr)_17rem]">
+        <div className="min-w-0 space-y-4 px-5 py-4">
           {error && (
             <p className="rounded-[var(--radius-sm)] bg-[color-mix(in_oklab,var(--danger)_12%,transparent)] px-3 py-2 text-[12px] text-[var(--danger)]">
               {error}
             </p>
           )}
 
-          {/* The card waits in the backlog: we offer to start it from here, without dragging
-             between columns (the same transition as the drag backlog->todo in Board.tsx). */}
-          {task.status === "backlog" && !editing && (
-            <div className="flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] border border-[var(--line)] px-3 py-2">
-              <p className="min-w-40 flex-1 text-[12px] leading-relaxed text-[var(--ink-muted)]">
-                {t("taskModal.backlogHint")}
-              </p>
-              <Button
-                variant="primary"
-                icon={PlayCircle}
-                loading={pending}
-                onClick={() => {
-                  // The description goes to work, not the title: there is nothing to send if it is
-                  // empty. The same refusal exists on the server; here it is caught earlier to
-                  // offer the editor right away (see EmptyDescriptionDialog).
-                  if (!hasDescription(task)) {
-                    setEmptyDesc(true);
-                    return;
-                  }
-                  void run(() => api.patchTask(task.id, { status: "todo" }));
-                }}
-              >
-                {pending ? t("taskModal.sending") : t("taskModal.toWork")}
-              </Button>
-            </div>
-          )}
-
-          {/* Deferred start: when the dispatcher will take the task and how to cancel it.
-             "Run now" simply removes the schedule: then the task goes through the shared queue. */}
-          {sched && !editing && (
-            <div className="flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] border border-[var(--line)] px-3 py-2">
-              <Clock size={13} aria-hidden className="text-[var(--ink-faint)]" />
-              <p className="min-w-40 flex-1 text-[12px] leading-relaxed text-[var(--ink-muted)]">
-                {sched.kind === "missed"
-                  ? t("taskModal.schedule.missed")
-                  : task.status !== "todo"
-                    ? // The dispatcher does not take a task from backlog or failed: the deadline takes effect only after "To do"
-                      t("taskModal.schedule.notQueued", {
-                        time: windowTime(sched.kind === "waiting" ? sched.at : Date.parse(task.start_after ?? "") || sched.until, language, now),
-                      })
-                    : sched.kind === "waiting"
-                      ? t("taskModal.schedule.waiting", { duration: formatDuration(t, sched.at - now) })
-                      : t("taskModal.schedule.window", { time: windowTime(sched.until, language, now) })}
-              </p>
-              {(sched.kind === "waiting" && task.status === "todo") || sched.kind === "missed" ? (
-                <Button
-                  variant={sched.kind === "waiting" ? "primary" : undefined}
-                  icon={sched.kind === "waiting" ? PlayCircle : undefined}
-                  loading={pending}
-                  onClick={() => void run(() => api.patchTask(task.id, { start_after: null, start_before: null }))}
-                >
-                  {sched.kind === "waiting" ? t("taskModal.schedule.startNow") : t("taskModal.schedule.clear")}
-                </Button>
-              ) : null}
-            </div>
-          )}
-
-          {/* The agent stopped and waits for a human: the very top of the dialog. A hook
-             request (permission, question with options, plan) is drawn with its own form;
-             without it, the general reply field, which goes into the session via stop and
-             resume. */}
-          {task.input_request && (
-            <InputRequestPanel
-              request={task.input_request}
-              pending={pending}
-              onDecide={(decision) => run(() => api.answerInput(task.id, task.input_request!.id, decision))}
-            />
-          )}
-          {task.blocker === "needs_input" && !task.input_request && (
-            <section className="overflow-hidden rounded-[var(--radius-sm)] border border-[color-mix(in_oklab,var(--st-blocked)_40%,transparent)]">
-              <div className="flex items-center gap-1.5 bg-[color-mix(in_oklab,var(--st-blocked)_14%,transparent)] px-3 py-1.5 text-[12px] font-semibold text-[var(--st-blocked)]">
-                <BLOCKER_META.needs_input.icon size={13} aria-hidden />
-                {t("taskModal.agentWaitingHeading")}
-              </div>
-              <div className="space-y-2 p-3">
-                {/* Without a hook request, this is the agent's whole final message: it can
-                   run a couple of screens, so it has its own scroll so that the reply field
-                   does not slide down. */}
-                <p className="max-h-72 overflow-y-auto whitespace-pre-wrap text-[13px] leading-relaxed">{task.blocker_detail}</p>
-                <DescriptionEditor
-                  label={t("taskModal.answerLabel")}
-                  textareaClassName="min-h-20"
-                  placeholder={t("taskModal.answerLabel")}
-                  value={answer}
-                  onChange={setAnswer}
-                />
-                {/* The command to attach to the session lives below, in the machine-lines
-                   block: there is no need to duplicate it here, and the space under the reply
-                   is needed by the button. */}
-                <div className="flex items-center justify-end gap-2">
-                  <Button
-                    variant="primary"
-                    loading={pending}
-                    disabled={!answer.trim()}
-                    onClick={() =>
-                      void run(() => api.addComment(task.id, answer.trim(), "answer")).then((ok) => {
-                        if (ok) setAnswer("");
-                      })
-                    }
-                  >
-                    {pending ? t("taskModal.sending") : t("taskModal.reply")}
-                  </Button>
-                </div>
-              </div>
-            </section>
-          )}
-
-          {outbox.length > 0 && (
-            <section className="overflow-hidden rounded-[var(--radius-sm)] border border-[var(--line-strong)]">
-              <div className="flex items-center gap-1.5 bg-[var(--sunken)] px-3 py-1.5 text-[12px] font-semibold text-[var(--ink)]">
-                <Send size={13} aria-hidden />
-                {task.outbox_state === "stalled"
-                  ? t("taskModal.outboxStalled")
-                  : task.outbox_state === "stopping"
-                    ? t("taskModal.outboxStopping")
-                    : t("taskModal.outboxWaiting")}
-              </div>
-              <div className="space-y-2 p-3">
-                {outbox.map((m) => (
-                  <DescriptionView key={m.id} text={m.body} compact />
-                ))}
-                {/* Soft delivery waits for the nearest tool call. If waiting gets tiresome,
-                   we interrupt the session: the same text goes as a resume, but with a stop. */}
-                {outbox.some((m) => m.mode === "soft") && (
-                  <Button
-                    icon={OctagonPause}
-                    loading={pending}
-                    onClick={() => void run(() => api.addComment(task.id, outbox[0].body, "answer", "interrupt"))}
-                  >
-                    {pending ? t("taskModal.sending") : t("taskModal.interruptSession")}
-                  </Button>
-                )}
-              </div>
-            </section>
-          )}
-
-          {task.blocker && task.blocker !== "needs_input" && task.blocker !== "untrusted" && blockerMeta && (
-            <section className="overflow-hidden rounded-[var(--radius-sm)] border border-[color-mix(in_oklab,var(--warn)_40%,transparent)]">
-              <div className="flex items-center gap-1.5 bg-[color-mix(in_oklab,var(--warn)_14%,transparent)] px-3 py-1.5 text-[12px] font-semibold text-[var(--warn)]">
-                <blockerMeta.icon size={13} aria-hidden />
-                {blockerLabel(t, task.blocker)}
-              </div>
-              <div className="space-y-2 p-3">
-                <p className="whitespace-pre-wrap text-[13px] leading-relaxed">{task.blocker_detail}</p>
-                {task.blocker === "conflict" && (
-                  <Button loading={pending} onClick={() => void run(() => api.patchTask(task.id, { blocker: null }))}>
-                    {pending ? t("taskModal.sending") : t("taskModal.conflictResolved")}
-                  </Button>
-                )}
-              </div>
-            </section>
-          )}
-
-          {task.status === "failed" && (
-            <section className="overflow-hidden rounded-[var(--radius-sm)] border border-[color-mix(in_oklab,var(--st-failed)_40%,transparent)]">
-              <div className="flex items-center gap-1.5 bg-[color-mix(in_oklab,var(--st-failed)_14%,transparent)] px-3 py-1.5 text-[12px] font-semibold text-[var(--st-failed)]">
-                <STATUS_META.failed.icon size={13} aria-hidden />
-                {t("taskModal.failedHeading")}
-              </div>
-              <div className="space-y-2 p-3">
-                <p className="whitespace-pre-wrap text-[13px] leading-relaxed">{task.blocker_detail}</p>
-                {task.blocker === "untrusted" && (
-                  <p className="text-[12px] leading-relaxed text-[var(--ink-muted)]">{t("taskModal.untrustedHint")}</p>
-                )}
-                <div className="flex flex-wrap gap-2">
-                  {task.blocker === "untrusted" && (
-                    <Button variant="primary" icon={ShieldCheck} loading={pending} onClick={() => void run(() => api.trustAndRetry(task.id))}>
-                      {pending ? t("taskModal.starting") : t("taskModal.trustAndStart")}
-                    </Button>
-                  )}
-                  <Button icon={RotateCcw} loading={pending} onClick={() => void run(() => api.retry(task.id))}>
-                    {pending ? t("taskModal.starting") : t("taskModal.retry")}
-                  </Button>
-                  {task.session_id && (
-                    <Button icon={PlayCircle} loading={pending} onClick={() => void run(() => api.resume(task.id))}>
-                      {pending ? t("taskModal.resuming") : t("taskModal.resumeSession")}
-                    </Button>
-                  )}
-                  <Button icon={CheckCircle2} disabled={pending} onClick={() => setClosing(true)}>
-                    {t("app.forceCloseConfirm")}
-                  </Button>
-                </div>
-              </div>
-            </section>
-          )}
-
-          {stuck && !editing && (
-            <div className="flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] border border-[var(--line)] px-3 py-2">
-              <p className="min-w-40 flex-1 text-[12px] leading-relaxed text-[var(--ink-muted)]">
-                {t("taskModal.stuckHint")}
-              </p>
-              <Button icon={CheckCircle2} disabled={pending} onClick={() => setClosing(true)}>
-                {t("app.forceCloseConfirm")}
-              </Button>
-            </div>
-          )}
-
-          {editing ? (
-            <TaskForm
-              projectId={task.project_id}
-              project={project ?? null}
-              projects={projects}
-              initial={task}
-              allTasks={allTasks}
-              excludeId={task.id}
-              onCancel={() => setEditing(false)}
-              onSubmit={(v: TaskFormValues) =>
-                void run(() => api.patchTask(task.id, v)).then((ok) => {
-                  if (ok) setEditing(false);
-                })
-              }
-              pending={pending}
-            />
-          ) : (
-            <section>
-              <h3 className="mb-1 text-[12px] font-medium text-[var(--ink-muted)]">{t("taskModal.descriptionHeading")}</h3>
-              {task.description ? (
-                <DescriptionView text={task.description} />
-              ) : (
-                <p className="text-[12px] text-[var(--ink-faint)]">
-                  {t("taskModal.noDescription")}
-                </p>
-              )}
-            </section>
-          )}
-
-          {report && (
-            <section className="rounded-[var(--radius-sm)] border border-[var(--line)] bg-[var(--sunken)] p-3">
-              <h3 className="mb-1 flex items-center gap-1.5 text-[12px] font-semibold text-[var(--ink)]">
-                <FileText size={12} aria-hidden />
-                {t("taskModal.reportHeading")}
-              </h3>
-              <p className="whitespace-pre-wrap text-[13px] leading-relaxed">{report.summary}</p>
-              {report.notes && (
-                <p className="mt-1.5 whitespace-pre-wrap text-[12px] leading-relaxed text-[var(--ink-muted)]">{report.notes}</p>
-              )}
-            </section>
-          )}
-
-          {usage && usage.total_tokens > 0 && !editing && (
-            <UsageSection usage={usage} live={task.status === "in_progress"} />
-          )}
-
-          {!editing && <TaskTimeline task={task} />}
-
-          {!editing && (
-            <section className="rounded-[var(--radius-sm)] border border-[var(--line)] px-3 py-1.5">
-              <TargetBranchRow
-                task={task}
-                editable={branchEditable}
-                pending={pending}
-                onChange={(branch) => void run(() => api.patchTask(task.id, { target_branch: branch }))}
-              />
-              {task.branch && <CopyRow icon={GitBranch} label={t("taskModal.branchRowLabel")} value={task.branch} />}
-              {task.worktree_path && <CopyRow icon={FolderGit2} label={t("taskModal.worktreeRowLabel")} value={task.worktree_path} />}
-              {task.job_id && <CopyRow icon={Terminal} label={t("taskModal.connectRowLabel")} value={`claude attach ${task.job_id}`} />}
-            </section>
+          {mismatch.length > 0 && task.target_branch && beforeWork && (
+            <BaseMismatchNotice branches={mismatch} branch={task.target_branch} onFix={(target_branch) => changeProperties({ target_branch })} />
           )}
 
           <section>
-            <h3 className="mb-2 text-[12px] font-medium text-[var(--ink-muted)]">{t("taskModal.commentsHeading")}</h3>
-            {task.comments.length > 0 && (
-              <ul className="mb-2 space-y-1.5">
-                {task.comments.map((c) => (
-                  <li
-                    key={c.id}
-                    className={cn(
-                      "rounded-[var(--radius-sm)] border-l-2 bg-[var(--sunken)] px-2.5 py-1.5 text-[13px] leading-relaxed",
-                      c.kind === "report"
-                        ? "border-dashed border-[var(--ink-faint)] opacity-80"
-                        : c.author === "user"
-                          ? "border-[var(--st-todo)]"
-                          : "border-[var(--line-strong)]",
-                    )}
-                  >
-                    <span className="mr-2 text-[11px] text-[var(--ink-faint)]">{commentLabel(t, c)}</span>
-                    <DescriptionView text={c.body} className="inline" compact />
-                  </li>
-                ))}
-              </ul>
-            )}
-            <DescriptionEditor
-              label={t("taskModal.notePlaceholder")}
-              placeholder={t("taskModal.notePlaceholder")}
-              textareaClassName="min-h-20"
-              value={note}
-              onChange={setNote}
+            <h3 className="mb-1 text-[12px] font-medium text-[var(--ink-muted)]">{t("taskModal.descriptionHeading")}</h3>
+            <InlineDescription
+              value={description.draft}
+              onChange={description.change}
+              onCommit={commitDescription}
+              editable={beforeWork && !archived}
+              editing={editingDescription}
+              onEditingChange={setEditingDescription}
             />
-            <div className="mt-2 flex justify-end gap-2">
-              <Button
-                icon={MessageSquarePlus}
-                loading={pending}
-                disabled={!note.trim()}
-                onClick={() =>
-                  void run(() => api.addComment(task.id, note.trim(), "comment")).then((ok) => {
-                    if (ok) setNote("");
-                  })
-                }
-              >
-                {pending ? t("taskModal.adding") : t("common.add")}
-              </Button>
-              {sendKind && (
-                // The label does not change during the request: otherwise a card with a badge would
-                // show two "Sending…" buttons at once: this one and "Reply" above.
-                <Button
-                  variant="primary"
-                  icon={Send}
-                  disabled={pending || !note.trim()}
-                  onClick={() =>
-                    void run(() => api.addComment(task.id, note.trim(), sendKind)).then((ok) => {
-                      if (ok) setNote("");
-                    })
-                  }
-                >
-                  {sendKind === "rework" ? t("taskModal.rework") : t("taskModal.toSession")}
-                </Button>
-              )}
-            </div>
-            {sendKind === "rework" && (
-              <p className="mt-1 text-[11px] text-[var(--ink-faint)]">
-                {t("taskModal.reworkHint")}
-              </p>
-            )}
-            {sendKind === "answer" && task.blocker !== "needs_input" && (
-              <p className="mt-1 text-[11px] text-[var(--ink-faint)]">
-                {t("taskModal.answerHint")}
-              </p>
-            )}
           </section>
 
-          {/* Card cleanup is at the very bottom and in a separate frame: one does not get
-             here by accident, and "archive" comes before "delete" because it is almost always
-             the one needed. */}
-          {!editing && (
-            <section className="flex flex-wrap items-center gap-2 rounded-[var(--radius-sm)] border border-[var(--line)] px-3 py-2">
-              <p className="min-w-40 flex-1 text-[12px] leading-relaxed text-[var(--ink-muted)]">
-                {archived
-                  ? t("taskModal.archivedHint")
-                  : stuck
-                    ? t("taskModal.stuckArchiveHint")
-                    : t("taskModal.archiveHint")}
-              </p>
+          <RelationsSection
+            task={task}
+            allTasks={allTasks}
+            projects={projects}
+            depsEditable={beforeWork && !archived}
+            subtasksEditable={!archived}
+            onDepsChange={(depends_on) => changeProperties({ depends_on })}
+            onOpenTask={onOpenTask}
+            onCreateSubtask={onCreateSubtask ? () => onCreateSubtask(task) : undefined}
+            onSetParent={(childId, parentId) => void run(() => api.patchTask(childId, { parent_task_id: parentId }))}
+            onWakeChange={(wake) => void run(() => api.patchTask(task.id, { wake_on_children: wake ? 1 : 0 }))}
+            onSetStage={(childId, stage) => void run(() => api.patchTask(childId, { stage }))}
+          />
+
+          {/* The thread, then the composer as the last child of this column, pinned to its bottom: see ActivityPanel. */}
+          <h3 className="mb-1! text-[12px] font-medium text-[var(--ink-muted)]">{t("taskModal.commentsHeading")}</h3>
+          <ActivityPanel
+            source={activitySource}
+            scrollRoot={body}
+            startAtEnd={focusOn === "thread" || Boolean(task.input_request)}
+            archived={archived}
+            fallbackNow={fallbackNow}
+            fallbackComments={task.comments}
+            onNow={setActivityNow}
+            onChanged={() => {
+              void load();
+              onChanged();
+            }}
+            startWork={toWork}
+            onForceClose={() => setClosing(true)}
+            quickActions={quickActions}
+            onBusy={setComposerBusy}
+            jumpRef={jumpToEnd}
+          />
+        </div>
+
+        {/* The column keeps its place while the thread scrolls: a property is changed in the middle
+           of reading, not after scrolling back up. */}
+        <aside className="border-t border-[var(--line)] md:border-l md:border-t-0">
+          <div className="space-y-3 px-3 py-3 md:sticky md:top-0 md:max-h-[calc(min(88vh,52rem)-5.5rem)] md:overflow-y-auto">
+            <PropertyRows
+              settings={cardSettings}
+              status={archived ? "done" : task.status}
+              onStatusChange={archived ? undefined : (to) => (to === "todo" ? toWork(() => api.patchTask(task.id, { status: to })) : void run(() => api.patchTask(task.id, { status: to })))}
+              statusPending={pending}
+              values={propertyValues}
+              onChange={changeProperties}
+              openId={openProperty}
+              onOpenIdChange={setOpenProperty}
+              projectId={task.project_id}
+              projects={projects}
+              allTasks={allTasks}
+              taskId={task.id}
+              branches={branches}
+              onOpenTask={onOpenTask}
+            />
+            {sched && (
+              <StartRow
+                sched={sched}
+                task={task}
+                now={now}
+                pending={pending}
+                onClear={() => void run(() => api.patchTask(task.id, { start_after: null, start_before: null }))}
+              />
+            )}
+            <RunSummary agent={agent} project={project} />
+            <QuickActionsSection actions={quickActions} send={quickSend} pending={pending} run={run} />
+            <WakeupsSection task={task} pending={pending} onAction={run} onOpenTask={onOpenTask} />
+            <ExecutionLog task={task} usage={usage} pending={pending} onAction={run} onOpenThread={() => jumpToEnd.current?.()} />
+            <DeliverablesSection task={task} />
+            <CardDetails task={task} allTasks={allTasks} onOpenTask={onOpenTask} />
+            {/* Card cleanup is last and quiet: one does not get here by accident, and "archive" comes
+               before "delete" because it is almost always the one needed. */}
+            <div className="flex flex-wrap gap-1 border-t border-[var(--line)] pt-2">
+              {/* Verifying, merging and failed cards offer it in the composer, next to what else can be done */}
+              {task.status === "in_progress" && (
+                <Button size="sm" variant="ghost" icon={CheckCircle2} disabled={pending} title={t("taskModal.stuckHint")} onClick={() => setClosing(true)}>
+                  {t("app.forceCloseConfirm")}
+                </Button>
+              )}
               {archived ? (
-                <Button
-                  icon={ArchiveRestore}
-                  loading={pending}
-                  onClick={() => void run(() => api.unarchive(task.id))}
-                >
+                <Button size="sm" variant="ghost" icon={ArchiveRestore} loading={pending} title={t("taskModal.archivedHint")} onClick={() => void run(() => api.unarchive(task.id))}>
                   {t("taskModal.unarchive")}
                 </Button>
               ) : (
                 !stuck && (
-                  <Button icon={Archive} loading={pending} onClick={() => void run(() => api.archive(task.id))}>
+                  <Button size="sm" variant="ghost" icon={Archive} loading={pending} title={t("taskModal.archiveHint")} onClick={() => void run(() => api.archive(task.id))}>
                     {t("taskModal.archive")}
                   </Button>
                 )
               )}
-              <Button variant="danger" icon={Trash2} disabled={pending} onClick={() => setDeleting(true)}>
+              <Button size="sm" variant="ghost" icon={Trash2} disabled={pending} title={stuck ? t("taskModal.stuckArchiveHint") : undefined} onClick={() => setDeleting(true)}>
                 {t("common.delete")}
               </Button>
-            </section>
-          )}
+            </div>
+          </div>
+        </aside>
         </div>
       </Modal>
 
-      <EmptyDescriptionDialog
-        open={emptyDesc}
+      <NotReadyDialog
+        open={notReady}
+        issues={issues}
         taskId={task.id}
         taskTitle={task.title}
-        onClose={() => setEmptyDesc(false)}
+        onClose={() => setNotReady(false)}
         onFix={() => {
-          setEmptyDesc(false);
-          setEditing(true);
+          setNotReady(false);
+          if (issues.includes("assignee")) setOpenProperty("agent");
+          else setEditingDescription(true);
         }}
       />
 

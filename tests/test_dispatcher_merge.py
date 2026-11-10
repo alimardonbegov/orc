@@ -6,7 +6,7 @@ import pytest
 from orc import git_ops
 from orc.dispatcher import CONFLICT_RETRY_LIMIT
 from orc.models import Blocker, TaskStatus
-from orc.report import REPORT_REL_PATH
+from orc.handoff import REPORT_REL_PATH
 
 
 def _in_merging(repo, dispatcher, project, git_repo, title="A", file_name="b.txt", target=None):
@@ -29,6 +29,41 @@ def test_merge_into_checked_out_clean_branch(repo, dispatcher, project, git_repo
     assert t.status == TaskStatus.DONE and t.done_at is not None
     assert (git_repo / "b.txt").exists()
     assert git_ops.git(["log", "-1", "--format=%s"], git_repo) == f"orc: merge task #{t.id}: A"
+
+
+def test_merge_removes_working_copy_and_branch(repo, dispatcher, project, git_repo):
+    # The branch is fully in the target after the merge, so the copy only takes disk space
+    t = _in_merging(repo, dispatcher, project, git_repo)
+    dispatcher.tick()
+    assert repo.get_task(t.id).status == TaskStatus.DONE
+    assert not Path(t.worktree_path).exists()
+    assert t.branch not in git_ops.list_branches(git_repo)
+    assert any("removed after the merge" in e["message"] for e in repo.list_events())
+
+
+def test_merge_keeps_working_copy_when_autoclean_is_off(repo, dispatcher, project, git_repo):
+    repo.set_setting("worktree_autoclean", "0")
+    t = _in_merging(repo, dispatcher, project, git_repo)
+    dispatcher.tick()
+    assert repo.get_task(t.id).status == TaskStatus.DONE
+    assert Path(t.worktree_path).exists()
+
+
+def test_merge_keeps_copy_of_parent_with_unfinished_subtasks(repo, dispatcher, project, git_repo):
+    # Waking the parent continues its session in this folder
+    t = _in_merging(repo, dispatcher, project, git_repo)
+    repo.add_task(project.id, "child", status="todo", parent_task_id=t.id)
+    dispatcher.tick()
+    assert repo.get_task(t.id).status == TaskStatus.DONE
+    assert Path(t.worktree_path).exists()
+
+
+def test_merge_keeps_copy_with_uncommitted_files(repo, dispatcher, project, git_repo):
+    t = _in_merging(repo, dispatcher, project, git_repo)
+    (Path(t.worktree_path) / "a.txt").write_text("unsaved\n")
+    dispatcher.tick()
+    assert repo.get_task(t.id).status == TaskStatus.DONE
+    assert Path(t.worktree_path).exists()
 
 
 def test_merge_autocommits_user_changes_first(repo, dispatcher, project, git_repo):
@@ -109,6 +144,7 @@ def test_conflict_calls_the_human_after_retry_limit(repo, dispatcher, project, g
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.MERGING and t.blocker == Blocker.CONFLICT
     assert str(CONFLICT_RETRY_LIMIT) in t.blocker_detail
+    assert t.detail_code == "conflict_unresolved"
 
 
 def test_conflict_calls_the_human_when_autoresolve_is_off(repo, dispatcher, fake_cli, project, git_repo):
@@ -450,3 +486,21 @@ def test_dirty_copy_badge_is_rechecked_and_cleared(repo, dispatcher, project, gi
     t = repo.get_task(t.id)
     assert t.blocker is None
     assert t.status == TaskStatus.DONE
+
+
+def test_merge_failure_without_the_branch_says_the_branch_is_gone(repo, dispatcher, project, git_repo, monkeypatch):
+    t = _in_merging(repo, dispatcher, project, git_repo, "A", "b1.txt")
+    git_ops.git(["worktree", "remove", "--force", t.worktree_path], git_repo)
+    git_ops.git(["branch", "-D", t.branch], git_repo)
+    monkeypatch.setattr(git_ops, "has_conflict", lambda *a, **kw: (_ for _ in ()).throw(git_ops.GitError("no such branch")))
+    dispatcher._process_merging()
+    t = repo.get_task(t.id)
+    assert t.status == TaskStatus.FAILED and t.detail_code == "branch_gone"
+
+
+def test_other_merge_failure_keeps_its_text_without_a_code(repo, dispatcher, project, git_repo, monkeypatch):
+    t = _in_merging(repo, dispatcher, project, git_repo, "A", "b1.txt")
+    monkeypatch.setattr(git_ops, "merge_no_ff", lambda *a, **kw: (_ for _ in ()).throw(git_ops.GitError("simulated")))
+    dispatcher._process_merging()
+    t = repo.get_task(t.id)
+    assert t.status == TaskStatus.FAILED and "simulated" in t.blocker_detail and t.detail_code is None

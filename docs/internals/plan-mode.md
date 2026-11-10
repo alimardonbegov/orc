@@ -66,8 +66,9 @@ the saved options itself:
 
     note: woke session aaa7d388 with its saved options (--name, --permission-mode, --model).
 
-So after `claude stop` + `claude --bg --resume` (exactly what `Dispatcher.answer` does) the session
-is in plan mode again. `respawnFlags` in `state.json` confirm this.
+So after `claude stop` + `claude --bg --resume` the session is in plan mode again. `respawnFlags` in
+`state.json` confirm this. Since then `resume_bg` has started passing the full set of options, see
+[message-delivery.md](message-delivery.md): the mode now comes from the task's parameters.
 
 **Fact 4. Approval through this channel does work.**
 Resume with the text "I approve the plan. Go ahead." — the session left planning, edited the file,

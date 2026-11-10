@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   DndContext,
   DragOverlay,
@@ -20,7 +20,7 @@ import { useTranslation, type TFunction } from "../i18n";
 import { DEFAULT_DONE_SORT, finishedAt, sortDone, type DoneSort } from "../sort";
 import { dayHeading } from "../dates";
 import { useNow } from "../hooks/useNow";
-import { hasDescription, needsAttention } from "../status";
+import { needsAttention, workIssues, type WorkIssue } from "../status";
 import { withUnviewedFirst } from "../viewing";
 import { IconButton } from "../ui/Button";
 import { Tip } from "../ui/Overlays";
@@ -84,15 +84,14 @@ export function canMove(from: TaskStatus, to: TaskStatus): boolean {
   return MANUAL_MOVES.has(`${from}>${to}`) || FORCE_MOVES.has(`${from}>${to}`);
 }
 
-/** Sending to "To do" hands the card to the dispatcher, which starts a session from the task's
- * description: the prompt gets the description, the title stays in the control room. So a card with
- * an empty description is not let into this column.
+/** Sending to "To do" hands the card to the dispatcher, which starts its agent's session from the
+ * description. So a card with nobody assigned or nothing written is not let into this column.
  *
  * Separate from canMove: the column stays accepting and the person can drop the card, and instead
  * of a silent rollback gets a dialog explaining what exactly is wrong. A prohibition hidden in the
  * column highlight cannot explain itself. */
-export function isMissingDescription(task: Task, to: TaskStatus): boolean {
-  return to === "todo" && !hasDescription(task);
+export function moveIssues(task: Task, to: TaskStatus): WorkIssue[] {
+  return to === "todo" ? workIssues(task) : [];
 }
 
 /** Whether the move requires human confirmation. Separate from canMove: the column is
@@ -132,13 +131,15 @@ interface Props {
   onReorder: (status: TaskStatus, orderedIds: number[]) => void;
   /** A card with an empty description is not sent to work: instead of the move we call for an
    * explanation. */
-  onEmptyDescription: (task: Task) => void;
+  onNotReady: (task: Task) => void;
   onOpen: (taskId: number) => void;
   onCreate: () => void;
   /** Search by number and title. */
   search?: string;
   /** Keep only tasks that will not go any further without a human. */
   attentionOnly?: boolean;
+  /** Keep only cards with this label (its id). */
+  labelId?: number | null;
   /** Show the "Done" column. */
   showDone?: boolean;
   /** Order of cards in the "Done" column (see sort.ts). */
@@ -149,11 +150,14 @@ interface Props {
   /** Result viewing (viewing.ts). Not set means the project does not track it: "Done" looks as
    * before, without marks and the unviewed shelf. */
   viewing?: { onToggle: (taskId: number, viewed: boolean) => void; onMarkAll: () => void };
+  /** Selection for bulk actions. `onVisible` reports the ids the board shows after its filters, so the selection can
+   * drop cards the owner no longer sees: a toolbar must never act on cards that are out of sight. */
+  selection?: { ids: ReadonlySet<number>; onToggle: (taskId: number) => void; onVisible: (ids: number[]) => void };
 }
 
 /** Project kanban board: four column compartments, strips moved by the rules of manual
  * transitions. */
-export function Board({ projectId, tasks, onMove, onReorder, onEmptyDescription, onOpen, onCreate, search = "", attentionOnly = false, showDone = true, showArchived = false, doneSort = DEFAULT_DONE_SORT, onDoneSortChange, viewing }: Props) {
+export function Board({ projectId, tasks, onMove, onReorder, onNotReady, onOpen, onCreate, search = "", attentionOnly = false, labelId = null, showDone = true, showArchived = false, doneSort = DEFAULT_DONE_SORT, onDoneSortChange, viewing, selection }: Props) {
   const { t, language } = useTranslation();
   const now = useNow();
   // Click on a card must not count as a drag: activate drag after a 6px shift
@@ -173,9 +177,21 @@ export function Board({ projectId, tasks, onMove, onReorder, onEmptyDescription,
     // badge.
     if (Boolean(t.archived_at) !== showArchived) return false;
     if (attentionOnly && !needsAttention(t)) return false;
+    if (labelId !== null && !t.labels?.some((l) => l.id === labelId)) return false;
     if (needle && !`#${t.id} ${t.title}`.toLowerCase().includes(needle)) return false;
     return true;
   });
+
+  // The selection follows what is on the board: a card that leaves it (a filter, the archive view, a project switch)
+  // leaves the selection too. Keyed by the ids, so the five-second poll that rebuilds the array does not fire it.
+  const visibleKey = own.map((t) => t.id).join(",");
+  // The callback goes through a ref: a caller that passes a fresh function each render must not re-fire the report.
+  const onVisible = useRef(selection?.onVisible);
+  onVisible.current = selection?.onVisible;
+  const reports = selection !== undefined;
+  useEffect(() => {
+    if (reports) onVisible.current?.(visibleKey ? visibleKey.split(",").map(Number) : []);
+  }, [visibleKey, reports]);
 
   // In the archive we do not hide the "Done" column: most archived cards end up there, and the
   // "Done" filter from the board would leave an empty screen here. Viewing is not tracked in the
@@ -221,8 +237,8 @@ export function Board({ projectId, tasks, onMove, onReorder, onEmptyDescription,
     }
 
     if (!canMove(task.status, to)) return;
-    if (isMissingDescription(task, to)) {
-      onEmptyDescription(task);
+    if (moveIssues(task, to).length > 0) {
+      onNotReady(task);
       return;
     }
     onMove(task.id, to, isForceMove(task.status, to));
@@ -262,6 +278,7 @@ export function Board({ projectId, tasks, onMove, onReorder, onEmptyDescription,
             summary={c.key === "done" ? <ColumnTokens tasks={byColumn(c.key)} /> : undefined}
             dayOf={c.key === "done" ? doneDayOf : undefined}
             viewing={c.key === "done" ? doneViewing : undefined}
+            selection={selection}
             action={
               c.key === "backlog" && !showArchived ? (
                 <Tip text={t("board.newTaskTip")}>

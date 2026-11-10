@@ -187,7 +187,7 @@ const PIPELINE: { label?: string; icon: LucideIcon; tone: TaskStatus; line: stri
   { icon: Inbox, tone: "todo", line: "orc tick · slots 1/2 · #42 ← todo" },
   { label: "worktree", icon: FolderGit2, tone: "in_progress", line: "git worktree add .claude/worktrees/orc-task-42 -b orc/task-42 dev" },
   { label: "claude --bg", icon: SquareTerminal, tone: "in_progress", line: "claude --bg --permission-mode auto \"…\"" },
-  { label: "report.json", icon: FileText, tone: "in_progress", line: "cat .orchestrator/report.json → {\"status\": \"success\"}" },
+  { label: "orc task done", icon: FileText, tone: "in_progress", line: "orc task done → #42 handed in" },
   { label: "verify_cmd", icon: ShieldCheck, tone: "verifying", line: "make test → 128 passed" },
   { label: "merge --no-ff", icon: GitMerge, tone: "merging", line: "git merge --no-ff orc/task-42 → dev" },
 ];
@@ -317,7 +317,7 @@ export function InputScene({ step }: { step: number }) {
         </div>
       </div>
 
-      {/* Task modal: the agent's question on top, the answer field below */}
+      {/* Task modal: the agent's question in the thread, the one composer below it */}
       <div
         className={cn(
           "flex min-w-0 flex-col gap-1.5 rounded-[7px] border border-[var(--line)] bg-[var(--surface)] p-2 shadow-[var(--shadow-pop)]",
@@ -354,7 +354,7 @@ export function InputScene({ step }: { step: number }) {
           {t("pages.demos.input.reply")}
         </div>
         <div className="mt-auto">
-          <p className="mb-0.5 text-[9.5px] font-medium text-[var(--ink-muted)]">{t("taskModal.answerLabel")}</p>
+          <p className="mb-0.5 text-[9.5px] font-medium text-[var(--ink-muted)]">{t("activity.replyLabel")}</p>
           <div className="flex items-center gap-1">
             <div
               className={cn(
@@ -372,7 +372,7 @@ export function InputScene({ step }: { step: number }) {
               )}
             >
               <Send size={9} aria-hidden />
-              {t("taskModal.reply")}
+              {t("activity.send")}
             </span>
           </div>
         </div>

@@ -7,34 +7,35 @@ import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
-from dataclasses import asdict, replace
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
-from orc import (branches, forecast, git_ops, inbox, inputs, projects as project_paths, routines, schedule, trust,
-                 usage, worktrees)
-from orc import machine
+from orc import (branches, failures, forecast, git_ops, handoff, inbox, inputs, projects as project_paths, routines, schedule, task_guide, trust,
+                 usage, wakeups, worktrees)
+from orc import child_wake, machine
 from orc.machine import MachineLoad
 from orc.attachments import AttachmentStore, expand_description
+from orc.chats import ChatRunner
 from orc.claude_cli import ClaudeCliError, JobState
 from orc.config import Settings
 from orc.db import ledger_cost
-from orc.models import Blocker, Project, Task, TaskStatus
+from orc.models import Blocker, Chat, Project, Task, TaskStatus
 from orc.prompt import DEFAULT_TEMPLATE, UNTRUSTED_NOTE, UNTRUSTED_OPEN, build_prompt, quote_untrusted
 from orc.quota import DEFAULT_QUOTA_PATTERNS, is_quota_error, reset_retry_at, retry_delay_minutes
-from orc.report import REPORT_REL_PATH, drop_report, read_report
-from orc import token_usage, transcript
+from orc import runs, token_usage, transcript
 from orc.claude_cli import project_slug
 from orc.delivery import DELIVERY_STALL_TICKS, MessageDelivery  # noqa: F401  tests import the constant from here
 from orc.merging import CONFLICT_RETRY_LIMIT, Merger  # noqa: F401  tests import the constant from here
 from orc.repo import Repo
+from orc import stages
 from orc.scheduler import ready_tasks
 # Re-export: RESUME_AFTER_CRASH and RESUMABLE_STATES are needed by the dispatcher itself, the rest by tests
 # and by code that imported them from here before the split
 from orc.sessions import (  # noqa: F401
     RESUMABLE_STATES, RESUME_AFTER_CRASH, STOP_TERMINAL_STATES, STOP_WAIT_ATTEMPTS, STOP_WAIT_BASE_SEC,
-    SessionRunner,
+    SessionRunner, with_handoff_reminder,
 )
 from orc.util import utc_now
 from orc.verify_pool import VerifyOutcome, VerifyPool
@@ -86,6 +87,9 @@ IN_FLIGHT_STALE_SEC = 15 * 60
 # and blocker_detail goes into every API response with a task list.
 WAITING_DETAIL_LIMIT = 4000
 
+# Why a task stopped by the owner is in failed (Dispatcher.stop_session). The card shows it as is.
+STOPPED_BY_OWNER = "the session was stopped by the owner"
+
 # Which statuses a card may be closed from by hand. Working statuses: the dispatcher moves the task
 # in them, and if it is stuck there (the session is silent and automation could not declare it
 # lost), without a manual exit the card hangs forever and holds a worker slot.
@@ -108,6 +112,11 @@ class DispatcherBusy(RuntimeError):
     """The dispatcher is busy with another pass for longer than the command is ready to wait."""
 
 
+def holds_slot(task: Task) -> bool:
+    """Whether a task counts against the worker limits: in progress and not asleep (orc/wakeups.py)."""
+    return task.status == TaskStatus.IN_PROGRESS and task.blocker != Blocker.SLEEPING
+
+
 def _human_duration(seconds: float) -> str:
     # "0.0 min" for a five-second check looks like a counting error
     return f"{seconds:.0f} s" if seconds < 90 else f"{seconds / 60:.1f} min"
@@ -121,6 +130,8 @@ class Dispatcher:
         self.settings = settings
         self.cli = cli
         self.attachments = AttachmentStore(repo, settings.data_dir / "attachments")
+        # Direct chats with agents run outside the dispatcher pass: a reply must not wait for a tick
+        self.chats = ChatRunner(repo, cli, settings, now=now, sleep=sleep)
         self.now = now
         self.sleep = sleep
         self.last_tick: str | None = None
@@ -209,7 +220,8 @@ class Dispatcher:
         started = time.monotonic()
         steps: dict[str, float] = {}
         for step in (self._backfill_usage, self._deliver_outbox, self._sync_running, self._retry_quota,
-                     self._process_verifying, self._process_merging, self._expire_schedules, self._spawn_routines,
+                     self._process_verifying, self._process_merging, self._wake_sleepers, self._wake_parents,
+                     self._expire_schedules, self._spawn_routines,
                      self._start_ready,
                      self._cleanup, self._cleanup_worktrees, self._reap_sessions, self._record_limits):
             step_started = time.monotonic()
@@ -234,7 +246,7 @@ class Dispatcher:
         return {
             "paused": self.repo.get_setting("dispatcher_paused", "0") == "1",
             "quota_retry_after": self.repo.get_setting("quota_retry_after"),
-            "running": len(self.repo.list_tasks(status=TaskStatus.IN_PROGRESS)),
+            "running": sum(1 for t in self.repo.list_tasks(status=TaskStatus.IN_PROGRESS) if holds_slot(t)),
             "last_tick": self.last_tick,
             "last_tick_duration_sec": self.last_tick_duration_sec,
             "last_tick_steps": self.last_tick_steps,
@@ -251,7 +263,8 @@ class Dispatcher:
 
     def _sync_running(self) -> None:
         for task in self.repo.list_tasks(status=TaskStatus.IN_PROGRESS):
-            if task.blocker == Blocker.QUOTA:
+            # A sleeper's session was shut down on purpose: its `stopped` is not a crash, and _wake_sleepers wakes it
+            if task.blocker in (Blocker.QUOTA, Blocker.SLEEPING):
                 continue
             try:
                 # read_state is inside the try too: it may raise (for example, OSError in a race
@@ -279,8 +292,9 @@ class Dispatcher:
         detail = (f"session state lost: state.json has been unavailable for {misses} ticks in a row. "
                   f"The session can be restarted with the 'Retry' button.")
         self.sessions.close_input_requests(task)
+        self.sessions.end_run(task, "failed")
         self.repo.update_task(task.id, status=TaskStatus.FAILED, state_miss_count=0,
-                              blocker=None, blocker_detail=detail)
+                              blocker=None, blocker_detail=detail, detail_code=failures.SESSION_LOST)
         # The state is lost, but the session process may have outlived state.json, so shut it down.
         self.sessions.release(task, "session state lost")
         self._event(task, f"#{task.id}: {detail}", "warn")
@@ -296,22 +310,34 @@ class Dispatcher:
         self._collect_usage(task, st)
         stopped = st.waiting or self._background_stale(st)
         # An alarm that the session set for itself does not count as waiting (the harness will wake it),
-        # but it does not cancel the turn's report either: there is no work behind it whose result would change the report.
-        if (stopped or st.only_timers) and self._session_quiet(st):
+        # but it does not cancel the turn's handoff either: there is no work behind it whose result would change it.
+        if stopped or st.only_timers:
             # Fallback channel: the wait is visible from state.json (end of turn is blocked or working with
             # tempo=idle, or working with tempo=blocked or needs). The primary one is the hook, which itself
             # registers the request (request_input) and sets the badge before the daemon finishes writing
             # state.json; then we change nothing here.
             turn = transcript.read_last_turn(st.transcript_path) if st.turn_ended else None
-            if self._reported_this_turn(task, turn):
-                # report.json is the last action per the prompt: once it is written in this turn, the work
-                # is handed in. The daemon sets `blocked` by text, and a final report with a list of "what is needed
-                # from you" is a question to it. And since Claude Code 2.1.293 there is no `done`
-                # at all: the end of any turn is working + idle.
-                why = "the daemon marked it as waiting for reply" if st.state == "blocked" else "the daemon did not mark it as finished"
-                self._event(task, f"#{task.id}: the session ended its turn with a report, treating it as finished, "
-                                  f"although {why}")
-                self._session_done(task)
+            task, handed = self._handoff_of_turn(task, turn)
+            # The 90 s silence only guards the daemon's guess. An explicit handoff in a turn that the transcript
+            # shows as over is not a guess, so it is acted on at once. Live background work (subagents, monitors)
+            # keeps `waiting` false, a message on its way and an open request are refused in _handoff_of_turn.
+            if not (handed and turn is not None and turn.ended) and not self._session_quiet(st):
+                handed = None
+                stopped = False  # not confirmed yet: fall through to the "alive" branch below
+            if handed == handoff.STATUS_FAILED:
+                # The agent has said it cannot: sending it back would only repeat that.
+                task = handoff.fill_summary(self.repo, task, turn.final_text)
+                self._fail(task, handoff.reason(task) or "the session gave up without giving a reason",
+                           failures.AGENT_REPORTED)
+                return
+            if handed == wakeups.STATUS_SLEEP and self._fall_asleep(task, turn):
+                return
+            if handed == handoff.STATUS_DONE:
+                # The explicit call is the last action per the session's instructions. The daemon sets `blocked`
+                # by text, and a final message with a list of "what is needed from you" is a question to it.
+                # And since Claude Code 2.1.293 there is no `done` at all: the end of any turn is working + idle.
+                self._event(task, f"#{task.id}: the session handed in the work")
+                self._session_done(task, turn)
                 return
             if stopped:
                 if task.blocker != Blocker.NEEDS_INPUT and not self._recently_answered(task):
@@ -328,12 +354,15 @@ class Dispatcher:
             if st.state == "working" and task.quota_retry_count:
                 self.repo.update_task(task.id, quota_retry_count=0)  # the session came alive, the quota episode is closed
         elif st.state == "done":
-            self._session_done(task)
+            self._session_done(task, transcript.read_last_turn(st.transcript_path))
         elif st.state in ("failed", "stopped"):
             self._handle_failure(task, st)
 
-    def _session_done(self, task: Task) -> None:
+    def _session_done(self, task: Task, turn: transcript.LastTurn | None = None) -> None:
+        handoff.fill_summary(self.repo, task, turn.final_text if turn else None)
+        self.repo.cancel_wakeups(task.id, "the work was handed in")
         self.sessions.close_input_requests(task)
+        self.sessions.end_run(task, "handed_in")
         self.repo.update_task(task.id, status=TaskStatus.VERIFYING, blocker=None,
                               blocker_detail=None, quota_retry_count=0)
         self.repo.set_setting("quota_attempt", "0")  # the quota is definitely available
@@ -342,22 +371,19 @@ class Dispatcher:
         # If verification fails, _verify_failed will wake the session via wake.
         self.sessions.release(task, "work handed in")
 
-    def _reported_this_turn(self, task: Task, turn: transcript.LastTurn | None) -> bool:
-        """Whether report.json was written in the session's last turn, i.e. after the reply that opened the turn.
+    def _handoff_of_turn(self, task: Task, turn: transcript.LastTurn | None) -> tuple[Task, str | None]:
+        """What the session's last turn handed in: done, failed or nothing, and the task as it is after reading it.
 
-        A report from a previous pass (verify failed, the owner answered a question) is older than that reply and
-        does not count. While an owner message is on its way into the session, the turn is not the last one yet."""
-        if turn is None or turn.started_at is None or not task.worktree_path:
-            return False
+        A signal from a previous pass (verify failed, the owner answered a question) is older than the message that
+        opened the turn and does not count. While an owner message is on its way into the session, the turn
+        is not the last one yet."""
+        if turn is None or turn.started_at is None:
+            return task, None
         if task.outbox_state is not None or self._recently_answered(task):
-            return False
+            return task, None
         if self.repo.open_input_request(task.id) is not None:
-            return False  # the hook holds a question: the report has nothing to do with it
-        try:
-            mtime = (Path(task.worktree_path) / REPORT_REL_PATH).stat().st_mtime
-        except OSError:
-            return False
-        return mtime >= turn.started_at
+            return task, None  # the hook holds a question: the handoff has nothing to do with it
+        return handoff.of_turn(self.repo, task, turn.started_at)
 
     @staticmethod
     def _waiting_detail(st: JobState, turn: transcript.LastTurn | None) -> str:
@@ -406,14 +432,17 @@ class Dispatcher:
             # The counter grows BEFORE the attempt: a failed resume (session unknown, daemon unavailable)
             # must count, otherwise the task is retried every tick until the end of time.
             task = self.repo.update_task(task.id, auto_resume_count=task.auto_resume_count + 1)
+            # The run that died ends here as failed: the resume below starts the next one.
+            self.sessions.end_run(task, "failed")
             try:
-                self.sessions.wake(task, RESUME_AFTER_CRASH)
+                self.sessions.wake(task, RESUME_AFTER_CRASH, trigger="crash")
             except Exception as e:
-                self._fail(task, f"the session was interrupted ({st.detail[:120]}), could not resume: {e}")
+                self._fail(task, f"the session was interrupted ({st.detail[:120]}), could not resume: {e}",
+                           failures.SESSION_LOST)
                 return
             self._event(task, f"#{task.id} was interrupted ({st.detail[:120]}), resuming", "warn")
         else:
-            self._fail(task, st.detail)
+            self._fail(task, st.detail, failures.SESSION_LOST)
 
     def _enter_quota_wait(self, task: Task, detail: str) -> None:
         already_waiting = self.repo.get_setting("quota_retry_after") is not None
@@ -429,6 +458,7 @@ class Dispatcher:
             why = "limit reset" if by_reset else f"backoff, attempt {attempt + 1}"
             self._event(task, f"quota limit on task #{task.id} ({detail[:120]}), "
                               f"dispatcher paused until {retry_at:%H:%M} ({why})", "warn")
+        self.sessions.end_run(task, "quota")
         self.repo.update_task(task.id, blocker=Blocker.QUOTA, blocker_detail=detail)
 
     def _quota_retry_at(self, attempt: int) -> tuple[datetime, bool]:
@@ -482,14 +512,108 @@ class Dispatcher:
                 # forever and never becomes failed.
                 self._fail(task, f"{QUOTA_RETRY_LIMIT} attempts in a row ended with a 'quota limit' "
                                  f"({(task.blocker_detail or '')[:120]}). Check the regexes in the settings "
-                                 f"(quota_patterns): this may be a false match.")
+                                 f"(quota_patterns): this may be a false match.",
+                           failures.QUOTA_LIMIT)
                 continue
             task = self.repo.update_task(task.id, quota_retry_count=task.quota_retry_count + 1)
             try:
-                self.sessions.wake(task, RESUME_AFTER_CRASH)
+                self.sessions.wake(task, RESUME_AFTER_CRASH, trigger="quota")
             except Exception as e:
                 log.exception("retry #%s", task.id)
                 self._enter_quota_wait(task, str(e))
+
+    # ---------- going to sleep and waking (orc/wakeups.py) ----------
+
+    def _fall_asleep(self, task: Task, turn: transcript.LastTurn | None) -> bool:
+        """The turn ended with `orc task wakeup`: shut the session down and free its slot until a wakeup fires.
+
+        False if nothing is left to wake it (the owner cancelled during the turn): the card then waits for its
+        owner like any turn without a handoff."""
+        pending = self.repo.list_wakeups(task.id, wakeups.PENDING)
+        if not pending:
+            return False
+        self.sessions.close_input_requests(task)
+        self.sessions.end_run(task, "sleeping")
+        detail = wakeups.sleeping_detail(pending)
+        task = self.repo.update_task(task.id, blocker=Blocker.SLEEPING, blocker_detail=detail,
+                                     quota_retry_count=0, auto_resume_count=0)
+        # Without the process the slot is really free: a live idle session still holds hundreds of megabytes.
+        self.sessions.release(task, "asleep until a wakeup")
+        self._event(task, f"#{task.id} is {detail}")
+        return True
+
+    def _wake_sleepers(self) -> None:
+        """Resume the sleeping cards whose wakeup came due, within the worker limits.
+
+        Before _start_ready: a sleeper already holds a worktree and a half-done job, so it goes ahead of new cards.
+        The wakeup is marked fired before the session is resumed, under the tick lock: a restart in between leaves
+        a card in progress with a stopped session, which the next sync resumes once as a crash, and never a second
+        fire."""
+        for task_id in self.repo.orphan_wakeup_tasks():
+            self.repo.cancel_wakeups(task_id, "the card is no longer in progress")
+        if self.repo.get_setting("dispatcher_paused", "0") == "1" or self.repo.get_setting("quota_retry_after"):
+            return
+        all_tasks = self.repo.list_tasks()
+        sleepers = [t for t in all_tasks if t.status == TaskStatus.IN_PROGRESS and t.blocker == Blocker.SLEEPING]
+        if not sleepers:
+            return
+        now = self.now()
+        due: list[tuple[Task, dict, str]] = []
+        for task in sleepers:
+            for wakeup in self.repo.list_wakeups(task.id, wakeups.PENDING):
+                reason = wakeups.due_reason(self.repo, wakeup, now)
+                if reason is not None:
+                    due.append((task, wakeup, reason))
+                    break
+        if not due:
+            return
+        projects = {p.id: p for p in self.repo.list_projects()}
+        used = Counter(t.project_id for t in all_tasks if holds_slot(t))
+        global_limit = self._int_setting("global_max_workers", 3, minimum=1)
+        for task, wakeup, reason in due:
+            project = projects.get(task.project_id)
+            if project is None or project.archived_at:
+                continue
+            if sum(used.values()) >= global_limit or used[task.project_id] >= project.max_workers:
+                detail = f"woken: {reason}; waiting for a free worker slot"
+                if task.blocker_detail != detail:
+                    self.repo.update_task(task.id, blocker_detail=detail)
+                continue
+            if not self.repo.end_wakeup(wakeup["id"], wakeups.FIRED, reason):
+                continue
+            self.repo.cancel_wakeups(task.id, f"another wakeup fired: {reason}")
+            used[task.project_id] += 1
+            self._event(task, f"#{task.id} wakes up: {reason}")
+            try:
+                self.sessions.wake(task, wakeups.wake_prompt(wakeup, reason), trigger="wakeup", detail=reason)
+            except Exception as e:
+                log.exception("waking #%s", task.id)
+                self._fail(task, f"could not wake the session ({reason}): {e}", failures.SESSION_LOST)
+
+    def create_wakeup(self, task_id: int, *, at: str | None, in_sec: int | None, watch_task_id: int | None,
+                      note: str) -> dict:
+        """`orc task wakeup` from a live session. Like hand_off it only records, without the lock: the dispatcher acts
+        when the turn is over."""
+        task = self._require(task_id)
+        row = wakeups.create(self.repo, task, self.now(), at=at, in_sec=in_sec, watch_task_id=watch_task_id, note=note)
+        self._event(task, f"#{task.id} asked to sleep {row['summary']}")
+        return row
+
+    def cancel_wakeup(self, task_id: int, wakeup_id: int) -> dict:
+        """The owner cancels a pending wakeup. A sleeper left with none stays asleep until the owner acts: falling
+        back to plain in-progress would make its stopped session look like a crash."""
+        with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
+            task = self._require(task_id)
+            row = self.repo.get_wakeup(wakeup_id)
+            if row is None or row["task_id"] != task.id:
+                raise LookupError(f"wakeup {wakeup_id} of task #{task.id} not found")
+            if not self.repo.end_wakeup(wakeup_id, wakeups.CANCELLED, "cancelled by the owner"):
+                raise ValueError("the wakeup is not pending any more")
+            if task.status == TaskStatus.IN_PROGRESS and task.blocker == Blocker.SLEEPING:
+                pending = self.repo.list_wakeups(task.id, wakeups.PENDING)
+                self.repo.update_task(task.id, blocker_detail=wakeups.sleeping_detail(pending))
+            self._event(task, f"#{task.id}: the owner cancelled the wakeup {wakeups.describe(row)}")
+            return wakeups.view(self.repo.get_wakeup(wakeup_id))
 
     # ---------- step: missed start windows ----------
 
@@ -525,15 +649,16 @@ class Dispatcher:
         """Create runs of routines whose slot has come (orc/routines.py). Before _start_ready,
         so that a fresh run starts in the same tick. Works on pause too: the card will wait
         in todo, and the rule "the previous run is still going" will not let a second one pile up."""
-        routines.run_due(self.repo, self.now(), self._emit)
+        routines.run_due(self.repo, self.now(), self._emit, wake=self.chats.wake,
+                         paused=self.repo.get_setting("dispatcher_paused", "0") == "1")
 
-    def run_routine(self, routine_id: int) -> Task:
+    def run_routine(self, routine_id: int) -> Task | Chat:
         """Run now: an out-of-turn run. The schedule does not shift."""
         with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
             routine = self.repo.get_routine(routine_id)
             if routine is None:
                 raise ValueError("routine not found")
-            return routines.spawn(self.repo, routine, self.now(), self._emit, manual=True)
+            return routines.spawn(self.repo, routine, self.now(), self._emit, manual=True, wake=self.chats.wake)
 
     def _emit(self, message: str, level: str, task_id: int | None, project_id: int | None) -> None:
         self.repo.add_event(message, level=level, task_id=task_id, project_id=project_id)
@@ -594,23 +719,25 @@ class Dispatcher:
         if reason and not self._manual_tick:
             return
         status_by_id = {t.id: t.status for t in all_tasks}
-        running = Counter(t.project_id for t in all_tasks if t.status == TaskStatus.IN_PROGRESS)
+        running = Counter(t.project_id for t in all_tasks if holds_slot(t))
         limits = {pid: p.max_workers for pid, p in by_id.items()}
         global_limit = self._int_setting("global_max_workers", 3, minimum=1)
-        ready = ready_tasks(todo, status_by_id, self.repo.all_deps(), dict(running), limits, global_limit)
+        deps = stages.effective_deps(self.repo.all_deps(), stages.stage_blockers((t.id, t.parent_task_id, t.stage) for t in all_tasks))
+        ready = ready_tasks(todo, status_by_id, deps, dict(running), limits, global_limit)
         if reason and ready:
             self.repo.add_event(f"start via the 'Run now' button despite the load: {reason}", level="warn")
         for task in ready:
             project = by_id.get(task.project_id)
             if project is None:  # the project was deleted between the queries
-                self._fail(task, f"project #{task.project_id} was deleted, nowhere to start")
+                self._fail(task, f"project #{task.project_id} was deleted, nowhere to start", failures.PROJECT_UNAVAILABLE)
                 continue
             status = project_paths.path_status(project.path)
             if not status["path_ok"]:
                 # The project folder was moved or deleted behind the dashboard's back. A bare git error about a
                 # nonexistent directory does not explain what to fix, so we say it directly.
                 self._fail(task, f"the project folder is unavailable ({status['path_error']}): {project.path}. "
-                                 f"Set a new path in the project settings or archive the project")
+                                 f"Set a new path in the project settings or archive the project",
+                           failures.PROJECT_UNAVAILABLE)
                 continue
             try:
                 self._start(task, project)
@@ -701,7 +828,7 @@ class Dispatcher:
             self.sessions_alive = None  # we do not know how many there are now, so we do not show the old number
             return
         owners = self.repo.session_owners()
-        keep = {t.job_id for t in self.repo.list_tasks(status=TaskStatus.IN_PROGRESS) if t.job_id}
+        keep = {t.job_id for t in self.repo.list_tasks(status=TaskStatus.IN_PROGRESS) if t.job_id and holds_slot(t)}
         ours = [s for s in live if s.get("kind") == "background" and s["id"] in owners]
         self.sessions_alive = len(ours)
         reaped: list[int] = []
@@ -776,9 +903,21 @@ class Dispatcher:
         scheduled = task.start_after is not None
         if task.resume_with and task.session_id and task.worktree_path and Path(task.worktree_path).exists():
             # Rework: continue the previous session in the same worktree
-            self.sessions.wake(task, task.resume_with)
-            self.repo.update_task(task.id, resume_with=None, start_after=None, start_before=None)
-            self._event(task, f"#{task.id} continued for rework")
+            trigger = task.resume_trigger or "rework"
+            self.sessions.wake(task, with_handoff_reminder(task.resume_with), trigger=trigger)
+            self.repo.update_task(task.id, resume_with=None, resume_trigger=None, start_after=None, start_before=None)
+            self._event(task, f"#{task.id} continued " + ("after its subtasks were done" if trigger == child_wake.TRIGGER
+                                                          else "for rework"))
+            return
+        if task.resume_trigger == child_wake.TRIGGER:
+            # A wake must continue the card's own session. Starting a fresh one would run the task statement again
+            # with no memory of the work, so the card goes back to done and says so.
+            self.repo.update_task(task.id, status=TaskStatus.DONE, done_at=self._now_iso(), resume_with=None,
+                                  resume_trigger=None)
+            self.repo.add_comment(task.id, child_wake.AUTHOR, "comment",
+                                  "The subtasks are done, but this card's session or working copy is gone, so it could "
+                                  "not be woken. Create a new card for the next step.")
+            self._event(task, f"#{task.id}: could not be woken after its subtasks, the working copy is gone", "warn")
             return
         target = task.target_branch or branches.base_branch(project, git_ops.current_branch(repo_path))
         if target not in git_ops.list_branches(repo_path):
@@ -797,13 +936,53 @@ class Dispatcher:
         prompt = build_prompt(
             self.repo.get_setting("prompt_template") or DEFAULT_TEMPLATE,
             title=task.title, description=self.with_images(task.description), branch=branch,
-            target_branch=target, verify_cmd=verify_cmd, report_path=REPORT_REL_PATH,
+            target_branch=target, verify_cmd=verify_cmd,
         )
         self.sessions.start(task, project, worktree, prompt, f"orc#{task.id} {task.title}",
-                            worktree_path=str(worktree), branch=branch, target_branch=target,
+                            trigger="start", worktree_path=str(worktree), branch=branch, target_branch=target,
                             start_after=None, start_before=None)
         how = "on schedule " if scheduled else ""
         self._event(task, f"#{task.id} started {how}in {branch}")
+
+    # ---------- step: wake parents whose subtasks are done ----------
+
+    def _wake_parents(self) -> None:
+        """Send a done parent back to work when all its subtasks are done (orc/child_wake.py). It goes through the
+        same door as a rework, to todo with a message, so the shared worker limits apply."""
+        tasks = self.repo.list_tasks()
+        if not any(t.parent_task_id is not None for t in tasks):
+            return
+        projects = {p.id: p for p in self.repo.list_projects()}
+
+        def note(parent: Task, message: str, level: str, key: str) -> None:
+            self.repo.update_task(parent.id, children_wake_key=key)
+            self._event(parent, message, level)
+
+        for parent, kids, key in child_wake.plan(self.repo, tasks, projects, note):
+            try:
+                self._wake_parent(parent, kids, key, projects.get(parent.project_id))
+            except Exception:
+                log.exception("waking #%s", parent.id)
+
+    def _wake_parent(self, parent: Task, kids: list[Task], key: str, project: Project | None) -> None:
+        def refuse(reason: str, comment: bool = True) -> None:
+            self.repo.update_task(parent.id, children_wake_key=key)
+            if comment:
+                self.repo.add_comment(parent.id, child_wake.AUTHOR, "comment",
+                                      f"All subtasks are done, but the card was not woken: {reason}.")
+            self._event(parent, f"#{parent.id}: not woken after its subtasks: {reason}", "warn")
+
+        if parent.children_wake_count >= child_wake.MAX_WAKES:
+            return refuse(f"it was already woken {child_wake.MAX_WAKES} times; send it back by hand if it needs more")
+        if child_wake.too_deep(self.repo, parent):
+            return refuse("it was created by a chain of agents too many generations deep, and only the owner "
+                          "may send it to work")
+        why = child_wake.refusal(parent)
+        if why:
+            return refuse(why + ": create a new card for the next step")
+        self._send_back(parent, child_wake.prompt_text(self.repo, parent, project, kids), author=child_wake.AUTHOR,
+                        kind=child_wake.KIND, shown=child_wake.conversation_line(kids), trigger=child_wake.TRIGGER,
+                        children_wake_key=key, children_wake_count=parent.children_wake_count + 1)
 
     # ---------- step: verification ----------
 
@@ -825,25 +1004,28 @@ class Dispatcher:
             return  # the check is running, the tick is not obliged to wait for it
         project = self.repo.get_project(task.project_id)
         if project is None:
-            self._fail(task, f"project #{task.project_id} was deleted: nowhere to verify or merge")
+            self._fail(task, f"project #{task.project_id} was deleted: nowhere to verify or merge", failures.PROJECT_UNAVAILABLE)
             return
         if not task.worktree_path or not Path(task.worktree_path).exists():
-            # The working copy was torn down by hand: read_report will return None, and the resume would go to
+            # The working copy was torn down by hand: the resume would go to
             # a subprocess with a nonexistent cwd and the task would get stuck in verifying forever.
             self._fail(task, f"the task working copy was not found ({task.worktree_path or 'path not recorded'}): "
-                             f"nothing to continue, press 'Retry' to start from scratch")
+                             f"nothing to continue, press 'Retry' to start from scratch",
+                       failures.BRANCH_GONE)
             return
-        report = read_report(Path(task.worktree_path))
-        if report is None:
-            self._verify_failed(task, "File .orchestrator/report.json not found. Write it in the format given in the task.")
+        # Normally the handoff is stored already. A task that sat here during the upgrade from report.json has
+        # only the file, and a session whose turn the daemon closed may have written one since the last look.
+        task = handoff.ingest_report(self.repo, task)
+        if task.handoff_status == handoff.STATUS_FAILED:
+            self._fail(task, handoff.reason(task) or "the session gave up without giving a reason",
+                           failures.AGENT_REPORTED)
             return
-        if report.status != "success":
-            self._verify_failed(task, "The report has status failed. Its summary and notes:\n"
-                                      + quote_untrusted(f"{report.summary} {report.notes}", limit=1000))
+        if task.handoff_status != handoff.STATUS_DONE:
+            self._verify_failed(task, "The session ended without handing in the work.")
             return
         cmd = task.verify_cmd or project.verify_cmd
         if not cmd:
-            self._queue_merge(task, report)
+            self._queue_merge(task)
             return
         self.verify_pool.submit(task.id, task.job_id, cmd, Path(task.worktree_path),
                                 project.verify_timeout_sec)
@@ -857,40 +1039,39 @@ class Dispatcher:
             # We do not write to the feed: the owner just did this themselves.
             log.info("verification result #%s is stale, discarding", task.id)
             return
+        # The owner reads the check in the card's execution log: before, a failed one's output reached only the agent
+        self.repo.add_task_check(fresh.id, outcome.job_id, outcome.cmd, outcome.ok, outcome.duration_sec,
+                                 runs.output_tail(outcome.output), outcome.exit_code, outcome.timed_out)
         if not outcome.ok:
             self._verify_failed(fresh, f"The check `{outcome.cmd}` failed. Its output:\n"
                                        + quote_untrusted(outcome.output[-4000:], limit=4000))
             return
-        report = read_report(Path(fresh.worktree_path)) if fresh.worktree_path else None
-        if report is None:
-            self._verify_failed(fresh, "File .orchestrator/report.json disappeared while the check was running. "
-                                       "Write it in the format given in the task.")
-            return
         self._event(fresh, f"#{fresh.id}: verification passed in {_human_duration(outcome.duration_sec)}")
-        self._queue_merge(fresh, report)
+        self._queue_merge(fresh)
 
-    def _queue_merge(self, task: Task, report) -> None:
-        self.repo.update_task(
-            task.id, status=TaskStatus.MERGING, merge_queued_at=self._now_iso(),
-            report_json=json.dumps(asdict(report), ensure_ascii=False), blocker=None, blocker_detail=None,
-        )
+    def _queue_merge(self, task: Task) -> None:
+        self.repo.update_task(task.id, status=TaskStatus.MERGING, merge_queued_at=self._now_iso(),
+                              blocker=None, blocker_detail=None)
         self._event(task, f"#{task.id} verified, queued for merge")
 
     def _verify_failed(self, task: Task, reason: str) -> None:
         if task.auto_resume_count < 1:
             # The counter goes before the attempt, as in _handle_failure: a failed resume counts too
             task = self.repo.update_task(task.id, auto_resume_count=task.auto_resume_count + 1)
-            # The note goes next to the block, and only when there is a block: "report not found" is
+            # The note goes next to the block, and only when there is a block: "no handoff" is
             # entirely our instruction, there is no data in it
             note = f"\n\n{UNTRUSTED_NOTE}" if UNTRUSTED_OPEN in reason else ""
             try:
-                self.sessions.wake(task, f"{reason}{note}\n\nFix it and write report.json again.")
+                command = task_guide.cli_command(self.settings.data_dir)
+                self.sessions.wake(task, f"{reason}{note}\n\nFix it and run `{command} task done` again.",
+                                   trigger="verify_failed")
             except Exception as e:
-                self._fail(task, f"{reason}\n\nFailed to resume the session: {e}")
+                self._fail(task, f"{reason}\n\nFailed to resume the session: {e}", failures.SESSION_LOST)
                 return
             self._event(task, f"#{task.id} failed verification, sent back for fixing", "warn")
         else:
-            self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker=None, blocker_detail=reason)
+            self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker=None, blocker_detail=reason,
+                                  detail_code=failures.CHECK_FAILED_AGAIN)
             self._event(task, f"#{task.id} failed verification again", "error")
 
     # ---------- step: merge, strictly one at a time ----------
@@ -932,6 +1113,32 @@ class Dispatcher:
                 self.deliver_messages(task.id)
             except Exception:
                 log.exception("immediate delivery of message #%s", task.id)
+            return self.repo.get_task(task.id)
+
+    def interrupt(self, task_id: int) -> Task:
+        """Esc in the session: the current action stops, the process and the background work stay.
+
+        Messages still on their way go along with it: Esc is what they were waiting for.
+        """
+        with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
+            task = self._require(task_id)
+            if task.status != TaskStatus.IN_PROGRESS or not task.job_id:
+                raise ValueError("only the session of a task in progress can be interrupted")
+            pending = self.repo.pending_messages(task.id)
+            if pending:
+                for message in pending:
+                    self.repo.update_message(message["id"], mode="interrupt")
+                self.deliver_messages(task.id)
+                return self.repo.get_task(task.id)
+            st = self.sessions.safe_state(task.job_id)
+            if st is None or st.state in RESUMABLE_STATES:
+                raise ValueError("the session is not running, there is nothing to interrupt")
+            try:
+                self.cli.send_interrupt(task.job_id)
+            except ClaudeCliError as e:
+                raise ValueError(f"could not reach the session: {e}")
+            self.sessions.close_input_requests(task)
+            self._event(task, f"#{task.id}: the owner interrupted the session")
             return self.repo.get_task(task.id)
 
     # The lock is DELIBERATELY not taken in request_input and answer_input. They are called by the session hook, which
@@ -1010,32 +1217,82 @@ class Dispatcher:
             if not task.session_id:
                 raise ValueError("the task's session is unknown: nothing to continue, create a new task")
             if not task.worktree_path or not Path(task.worktree_path).exists():
-                raise ValueError("the task's working copy has already been deleted: nothing to continue, create a new task")
-            # A running verification of this task is no longer needed by anyone: its result belongs
-            # to a state that is about to disappear.
-            self.verify_pool.cancel(task_id)
-            # The previous report is about to disappear from task.report_json (see below); without this
-            # a rework would look as if the previous submission never existed.
-            # We put it into the conversation before the "rework" mark so that the order reads
-            # as it happened: first what was handed in, then why it was sent back.
-            report = self._parse_json(task.report_json)
-            if report:
-                summary = str(report.get("summary") or "").strip()
-                notes = str(report.get("notes") or "").strip()
-                archived = "\n\n".join(part for part in (summary, notes) if part)
-                if archived:
-                    self.repo.add_comment(task.id, "claude", "report", archived)
-            self.repo.add_comment(task.id, "user", "rework", text)
-            drop_report(Path(task.worktree_path))
-            # Undelivered messages from the previous pass must not surface in the new work
-            inbox.clear(Path(task.worktree_path))
-            task = self.repo.update_task(
-                task.id, status=TaskStatus.TODO, resume_with=self.with_images(text), blocker=None, blocker_detail=None,
-                auto_resume_count=0, state_miss_count=0, quota_retry_count=0, conflict_retry_count=0,
-                report_json=None, done_at=None, merge_queued_at=None,
-            )
-            self._event(task, f"#{task.id} sent for rework")
-            return task
+                task = self._restore_copy(task)
+            return self._send_back(task, text)
+
+    def _restore_copy(self, task: Task) -> Task:
+        """Make the working copy of a finished card again, so its session can be continued in the same folder.
+
+        The merge removes the copy and the branch (orc/worktrees.py:remove_merged), but the card keeps the session id
+        and the path, and Claude Code finds a session by the folder it ran in. So the copy is recreated at the very
+        same path. A branch that is fully in the target carries nothing of its own and is started again from the
+        target's tip, so the continued work does not begin on stale code. A branch with commits of its own is kept.
+        Refuses only when there is really nothing to continue.
+        """
+        gone = "the task's working copy has already been deleted and cannot be restored: create a new task"
+        project = self.repo.get_project(task.project_id)
+        if project is None or not task.worktree_path:
+            raise ValueError(gone)
+        repo_path = Path(project.path)
+        path = Path(task.worktree_path)
+        branch = task.branch or f"orc/task-{task.id}"
+        # Only the place orc itself makes copies in: a path that points elsewhere was never ours to recreate
+        if path != repo_path / ".claude" / "worktrees" / f"orc-task-{task.id}":
+            raise ValueError(gone)
+        try:
+            target = task.target_branch or branches.base_branch(project, git_ops.current_branch(repo_path))
+            existing = git_ops.list_branches(repo_path)
+            if target not in existing:
+                raise ValueError(f"target branch {target} no longer exists in the repository: "
+                                 "the working copy cannot be restored")
+            git_ops.prune_worktrees(repo_path)  # a stale record of the deleted folder would block the new one
+            if branch not in existing:
+                git_ops.add_worktree(repo_path, path, branch, target)
+            elif git_ops.worktree_for_branch(repo_path, branch) is not None:
+                raise ValueError(f"branch {branch} is checked out in another folder: the working copy cannot be restored")
+            elif git_ops.is_merged(repo_path, branch, target):
+                git_ops.delete_branch(repo_path, branch)
+                git_ops.add_worktree(repo_path, path, branch, target)
+            else:
+                git_ops.add_temp_worktree(repo_path, path, branch)
+        except git_ops.GitError as e:
+            raise ValueError(f"could not restore the working copy: {e}") from e
+        git_ops.ensure_exclude(repo_path, ".orchestrator/")
+        self._event(task, f"#{task.id}: working copy restored at {path} to continue the session")
+        return self.repo.update_task(task.id, branch=branch, target_branch=target)
+
+    def _send_back(self, task: Task, text: str, *, author: str = "user", kind: str = "rework",
+                   shown: str | None = None, trigger: str | None = None, **extra) -> Task:
+        """A done card back to the queue with a message for its session. Rework and the wake of a parent share it.
+
+        `shown` is what the conversation displays when it differs from the text the session gets."""
+        task_id = task.id
+        # A running verification of this task is no longer needed by anyone: its result belongs
+        # to a state that is about to disappear.
+        self.verify_pool.cancel(task_id)
+        # The previous report is about to disappear from task.report_json (see below); without this
+        # a rework would look as if the previous submission never existed.
+        # We put it into the conversation before the "rework" mark so that the order reads
+        # as it happened: first what was handed in, then why it was sent back.
+        report = self._parse_json(task.report_json)
+        if report:
+            summary = str(report.get("summary") or "").strip()
+            notes = str(report.get("notes") or "").strip()
+            archived = "\n\n".join(part for part in (summary, notes) if part)
+            if archived:
+                self.repo.add_comment(task.id, "claude", "report", archived)
+        self.repo.add_comment(task.id, author, kind, shown if shown is not None else text)
+        task = handoff.clear(self.repo, task)
+        # Undelivered messages from the previous pass must not surface in the new work
+        inbox.clear(Path(task.worktree_path))
+        task = self.repo.update_task(
+            task.id, status=TaskStatus.TODO, resume_with=self.with_images(text), blocker=None, blocker_detail=None,
+            auto_resume_count=0, state_miss_count=0, quota_retry_count=0, conflict_retry_count=0,
+            report_json=None, done_at=None, merge_queued_at=None,
+            resume_trigger=trigger, **extra,
+        )
+        self._event(task, f"#{task.id} sent for rework" if trigger is None else f"#{task.id} woken: its subtasks are done")
+        return task
 
     def retry(self, task_id: int) -> Task:
         """failed -> todo from scratch: the old worktree, branch and session are deleted."""
@@ -1049,6 +1306,7 @@ class Dispatcher:
             # A running verification of this task is no longer needed by anyone: its result belongs
             # to a state that is about to disappear.
             self.verify_pool.cancel(task_id)
+            self.sessions.end_run(task, "stopped")  # normally ended already: the task is failed
             self._drop_worktree(Path(project.path), task)
             if task.job_id:
                 # What was spent is not reset: the attempt's spending is part of the task's spending. We count before
@@ -1062,13 +1320,14 @@ class Dispatcher:
                 task.id, status=TaskStatus.TODO, job_id=None, session_id=None, worktree_path=None, branch=None,
                 auto_resume_count=0, state_miss_count=0, quota_retry_count=0, conflict_retry_count=0,
                 blocker=None, blocker_detail=None, merge_queued_at=None, report_json=None, hook_secret=None,
+                handoff_at=None, handoff_status=None,
             )
 
     def trust_and_retry(self, task_id: int) -> Task:
         """The owner confirmed trust in the project folder in the dashboard: we record it and start again.
 
         We write trust onto the project folder itself, after which the worktree of every task of this project
-        is trusted automatically (orc/sessions.py, _launch), and the question no longer comes up.
+        is trusted automatically (orc/sessions.py, launch), and the question no longer comes up.
         """
         with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
             task = self._require(task_id)
@@ -1079,32 +1338,152 @@ class Dispatcher:
                 raise ValueError(f"project #{task.project_id} was deleted")
             trust.grant(self.settings.claude_json_path, project.path)
             self._event(task, f"project folder {project.path} was granted Claude Code trust")
-            return self.retry(task_id)
+            restarted = self.retry(task_id)
+            # The folder is trusted for the whole project: the other cards that stopped on the same question
+            # (failed with the untrusted blocker, never had a session) go back to To do the way a retry does.
+            siblings = [t for t in self.repo.list_tasks(project_id=task.project_id, status=TaskStatus.FAILED)
+                        if t.id != task_id and t.blocker == Blocker.UNTRUSTED and not t.session_id]
+            sent_back = []
+            for sibling in siblings:
+                try:
+                    self.retry(sibling.id)
+                    sent_back.append(sibling.id)
+                except ValueError:
+                    log.warning("could not restart #%s after trusting the folder", sibling.id, exc_info=True)
+            if sent_back:
+                names = ", ".join(f"#{i}" for i in sent_back)
+                self._event(restarted, f"trusting {project.path} also sent back to To do: {names}")
+            return restarted
 
-    def resume_failed(self, task_id: int) -> Task:
-        """failed -> in_progress with the same session."""
+    def stop_session(self, task_id: int) -> Task:
+        """The Stop button: the agent stops now, and the task waits for the owner's decision.
+
+        A bare `claude stop` is not enough: the next tick would see in_progress + stopped, take it for a
+        crash and resume the session. So the task leaves in_progress under the same lock, and the
+        tick never sees that state. Failed is the existing "stopped, your move" state: it frees the
+        worker slot and already has Resume, Retry and Close; the branch and the working copy stay.
+
+        An unconfirmed stop does not keep the task in work: the reaper finishes off a session of a
+        task that is not running, and `wake` will not resume one it has not seen stopped.
+        """
+        with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
+            task = self._require(task_id)
+            if task.status != TaskStatus.IN_PROGRESS:
+                raise ValueError(f"only a task in progress can be stopped, and this one is in {task.status}")
+            if task.job_id:
+                try:
+                    self.cli.stop(task.job_id)
+                    self.sessions.wait_stopped(task)
+                except Exception:
+                    log.warning("claude stop %s failed while stopping #%s", task.job_id, task.id, exc_info=True)
+                self._collect_usage(task, self.sessions.safe_state(task.job_id))
+            pending = self.repo.pending_messages(task.id)
+            if pending:
+                self.delivery.fail_messages(task, pending, "the session was stopped by the owner")
+            self.sessions.close_input_requests(task)
+            self.sessions.end_run(task, "stopped")
+            task = self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker=None,
+                                         blocker_detail=STOPPED_BY_OWNER, outbox_state=None,
+                                         detail_code=failures.STOPPED_BY_OWNER)
+            self._event(task, f"#{task.id}: {STOPPED_BY_OWNER}", "warn")
+            return task
+
+    def resume_failed(self, task_id: int, text: str | None = None) -> Task:
+        """failed -> in_progress with the same session. `text` is the owner's word to go with it."""
         with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
             task = self._require(task_id)
             if task.status != TaskStatus.FAILED or not task.session_id:
                 raise ValueError("resume is only allowed for a failed task that has a session")
             try:
-                self.sessions.wake(task, RESUME_AFTER_CRASH)
+                self.sessions.wake(task, with_handoff_reminder(self.with_images(text)) if text else RESUME_AFTER_CRASH, trigger="resume")
             except ClaudeCliError as e:
                 # The session did not stop (or the daemon refused): the task stays failed, we give the owner
                 # a clear reason, not a 500.
                 raise ValueError(f"could not resume the session: {e}") from e
+            # Only now: a refused resume leaves the failed card as it was. The session's "I give up" is over.
+            handoff.clear(self.repo, task)
+            if text:
+                self.repo.add_comment(task.id, "user", "answer", text)
             # The task is in progress again: a start window set on a failed one ("retry overnight") loses its meaning.
             # Otherwise it would invisibly live on until the next retry/rework and run into "window has passed".
             self.repo.update_task(task.id, start_after=None, start_before=None)
             self._event(task, f"#{task.id} resumed manually")
             return self.repo.get_task(task.id)
 
+    def hand_off(self, task_id: int, status: str, summary: str = "") -> dict:
+        """A session says the work is handed in (`orc task done`) or cannot be done (`orc task fail`).
+
+        This only records the signal: the agent is still in its turn, and the dispatcher acts when the turn is
+        over. No lock, for the reason given at request_input: this comes from a live session, and it writes
+        only its own columns. What the agent left uncommitted is refused now, while it can still fix it,
+        rather than after a verification or a merge that does not see those files.
+        """
+        task = self._require(task_id)
+        if task.status != TaskStatus.IN_PROGRESS:
+            raise ValueError(f"task #{task.id} is {task.status}, not in progress: there is nothing to hand in")
+        untracked: list[str] = []
+        if status == handoff.STATUS_DONE:
+            untracked = self._check_committed(task)
+        handoff.record(self.repo, task.id, status, summary)
+        return {"task_id": task.id, "handoff_status": status, "untracked": untracked}
+
+    def accept(self, task_id: int) -> Task:
+        """The owner takes the work as handed in: the agent forgot to, or gave up too early.
+
+        Verification still runs, and goes back to the session once if it fails, as for any other handoff."""
+        with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
+            task = self._require(task_id)
+            if task.archived_at:
+                raise ValueError("the card is archived: bring it back first")
+            has_copy = bool(task.worktree_path) and Path(task.worktree_path).exists()
+            waiting = (task.status == TaskStatus.IN_PROGRESS and task.blocker in (Blocker.NEEDS_INPUT, Blocker.SLEEPING)
+                       and task.outbox_state is None and self.repo.open_input_request(task.id) is None)
+            if not waiting and not (task.status == TaskStatus.FAILED and has_copy):
+                raise ValueError("only a card waiting for its owner's reply, or a failed card with a working copy, "
+                                 "can be accepted")
+            if not has_copy:
+                raise ValueError("the card has no working copy: there is nothing to accept")
+            if not task.session_id:
+                # It failed before any session ran (an untrusted folder, for example): the copy holds no agent's work
+                raise ValueError("no session has run on this card: there is no agent's work to accept")
+            self._check_committed(task)
+            turn = transcript.read_last_turn(self._last_transcript(task))
+            task = handoff.record(self.repo, task.id, handoff.STATUS_DONE, turn.final_text if turn else "")
+            task = self.repo.update_task(task.id, auto_resume_count=0)
+            self._event(task, f"#{task.id}: the owner accepted the work, it goes to verification")
+            self._session_done(task)
+            return self.repo.get_task(task.id)
+
+    @staticmethod
+    def _check_committed(task: Task) -> list[str]:
+        """Refuse a working copy with uncommitted changes to tracked files. Returns the untracked files, which
+        are not a refusal: nobody can tell a forgotten file from a build artifact."""
+        if not task.worktree_path or not Path(task.worktree_path).exists():
+            raise ValueError(f"task #{task.id} has no working copy: there is nothing to hand in")
+        try:
+            tracked, untracked = git_ops.uncommitted_files(Path(task.worktree_path))
+        except git_ops.GitError as e:
+            raise ValueError(f"could not read the state of the working copy: {e}") from e
+        if tracked:
+            raise ValueError("uncommitted changes in tracked files: " + ", ".join(tracked[:30])
+                             + (f" and {len(tracked) - 30} more" if len(tracked) > 30 else "")
+                             + ". Commit them or revert them first.")
+        return untracked
+
+    def _last_transcript(self, task: Task) -> str | None:
+        """The transcript of the task's latest session, also when the daemon has already forgotten the job."""
+        st = self.sessions.safe_state(task.job_id) if task.job_id else None
+        if st is not None and st.transcript_path:
+            return st.transcript_path
+        sessions = [row for row in self.repo.list_task_sessions(task.id) if row.get("transcript_path")]
+        return sessions[-1]["transcript_path"] if sessions else None
+
     def force_done(self, task_id: int) -> Task:
         """Emergency manual close: the card goes to done bypassing verification and merge.
 
         The only door out of the working statuses and out of failed: the other manual
         transitions from there are still forbidden. It is needed for stuck cards: the ordinary
-        path (report -> verification -> merge queue) will no longer pull them out, and while the card is in
+        path (handoff -> verification -> merge queue) will no longer pull them out, and while the card is in
         in_progress it occupies a worker slot and lies that someone is working. For
         failed it is the same exit when you want neither to retry nor to resume the task: it
         simply did not make it and is closed by hand like any ordinary card.
@@ -1139,6 +1518,7 @@ class Dispatcher:
             if pending:
                 self.delivery.fail_messages(task, pending, "the task was closed manually")
             self.sessions.close_input_requests(task)
+            self.sessions.end_run(task, "stopped")
             detail = f"was closed manually from status '{was}': verification and merge were not run"
             task = self.repo.update_task(
                 task.id, status=TaskStatus.DONE, done_at=self._now_iso(), blocker=None, blocker_detail=detail,
@@ -1147,7 +1527,7 @@ class Dispatcher:
             )
             # A comment, not just an event: in the feed the entry gets lost among a hundred others,
             # while on the card it stays forever, including for whoever opens it in a month
-            # and wonders why it is "done" without a report and without a merge.
+            # and wonders why it is "done" without a handoff and without a merge.
             self.repo.add_comment(task.id, "user", "comment", f"The task {detail}. Branch "
                                                               f"{task.branch or 'not created'} is not merged.")
             self._event(task, f"#{task.id} closed manually from '{was}': the branch is not merged", "warn")
@@ -1180,6 +1560,38 @@ class Dispatcher:
             task = self.repo.update_task(task.id, archived_at=None)
             self._event(task, f"#{task.id} restored from the archive")
             return task
+
+    def move_task(self, task_id: int, project_id: int, target_branch: str, agent_id: int | None) -> Task:
+        """Move a card that has not started to another project, with the base branch and agent already
+        chosen for it. Under the lock, so that a tick cannot start the card in the old repository between
+        the check and the write.
+
+        Only a card with nothing behind it can move: no worktree, branch or session in the old repository,
+        and not a run of a routine (the routine belongs to the old project). A queued card that is left
+        without an agent goes back to the backlog, as it does when its agent is taken off.
+        """
+        with self._exclusive(COMMAND_LOCK_TIMEOUT_SEC):
+            task = self._require(task_id)
+            if task.project_id == project_id:
+                raise ValueError(f"card #{task_id} is already in this project")
+            if task.status not in (TaskStatus.BACKLOG, TaskStatus.TODO):
+                raise ValueError(f"card #{task_id} is {task.status}: only a card that has not started can move to "
+                                 f"another project (its work lives in the repository of the old one)")
+            if task.worktree_path or task.branch or task.job_id or task.session_id:
+                raise ValueError(f"card #{task_id} already has a worktree or a session in its project: "
+                                 f"it cannot move. Create a new card in the other project instead")
+            if task.routine_id is not None:
+                raise ValueError(f"card #{task_id} is a run of a routine, and the routine stays in its project")
+            old = self.repo.get_project(task.project_id)
+            status = TaskStatus.BACKLOG if agent_id is None else task.status
+            moved = self.repo.move_task_to_project(
+                task.id, project_id, target_branch=target_branch, agent_id=agent_id, status=str(status), position=None)
+            new = self.repo.get_project(project_id)
+            self._event(moved, f"#{moved.id} moved from project {old.name if old else task.project_id} "
+                               f"to {new.name if new else project_id}")
+            self.repo.add_event(f"#{moved.id} «{moved.title}» moved to project {new.name if new else project_id}",
+                                project_id=task.project_id)
+            return moved
 
     def delete_task(self, task_id: int, force: bool = False, drop_worktree: bool = True) -> dict:
         """Delete a task for good: the DB row, the session and (by default) its worktree with the branch.
@@ -1228,6 +1640,7 @@ class Dispatcher:
                     self.repo.add_event(f"#{task.id} deleted, but removing {task.worktree_path or task.branch} "
                                         f"failed: {e}", level="warn", project_id=task.project_id)
             self.repo.delete_task(task.id)
+            inputs.hook_secret_path(self.settings.data_dir, task.id).unlink(missing_ok=True)
             # We write the event AFTER the deletion and without task_id: the task row no longer exists, and the foreign key
             # events.task_id can no longer be pointed at it.
             self.repo.add_event(f"#{task.id} «{task.title}» deleted for good", level="warn",
@@ -1402,10 +1815,12 @@ class Dispatcher:
             now = now.replace(tzinfo=at.tzinfo)
         return (now - at).total_seconds() < INPUT_ANSWER_GRACE_SEC
 
-    def _fail(self, task: Task, detail: str) -> None:
+    def _fail(self, task: Task, detail: str, code: str | None = None) -> None:
         """The only way into failed: status, badge and event are always consistent."""
         self.sessions.close_input_requests(task)
-        self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker=None, blocker_detail=detail)
+        self.repo.cancel_wakeups(task.id, "the task failed")
+        self.sessions.end_run(task, "failed")
+        self.repo.update_task(task.id, status=TaskStatus.FAILED, blocker=None, blocker_detail=detail, detail_code=code)
         # Usually the failed task's session is already dead, in which case release does nothing.
         # "Resume session" will wake it through wake.
         self.sessions.release(task, "task failed")

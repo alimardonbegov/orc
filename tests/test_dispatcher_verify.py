@@ -3,7 +3,7 @@ import shutil
 from pathlib import Path
 
 from orc.models import TaskStatus
-from orc.report import REPORT_REL_PATH
+from orc.handoff import REPORT_REL_PATH
 from orc.verify import VerifyResult
 
 
@@ -42,7 +42,7 @@ def test_missing_report_resumes_once(repo, dispatcher, fake_cli, project):
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.IN_PROGRESS and t.auto_resume_count == 1
-    assert "report.json" in fake_cli.calls[-1][3]
+    assert "task done" in fake_cli.calls[-1][3]
 
 
 def test_failed_report_after_resume_fails_task(repo, dispatcher, fake_cli, project):
@@ -52,6 +52,7 @@ def test_failed_report_after_resume_fails_task(repo, dispatcher, fake_cli, proje
     dispatcher.tick()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED and "could not" in t.blocker_detail
+    assert t.detail_code == "agent_reported"
 
 
 def test_red_verify_resumes_with_output(repo, dispatcher, fake_cli, project, settle):
@@ -63,6 +64,21 @@ def test_red_verify_resumes_with_output(repo, dispatcher, fake_cli, project, set
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.IN_PROGRESS
     assert "FAIL_MARKER" in fake_cli.calls[-1][3]
+    assert t.detail_code is None  # the first red check is not a failure yet
+
+
+def test_second_red_verify_fails_with_its_code(repo, dispatcher, fake_cli, project, settle):
+    repo.update_project(project.id, verify_cmd="echo FAIL_MARKER; exit 1")
+    t = _started(repo, dispatcher, project, auto_resume_count=1)
+    _write_report(t)
+    fake_cli.set_state(t.job_id, "done")
+    settle()
+    t = repo.get_task(t.id)
+    assert t.status == TaskStatus.FAILED and "FAIL_MARKER" in t.blocker_detail
+    assert t.detail_code == "check_failed_again"
+    # A retry clears the text, and the code with it: it must not outlive its text
+    dispatcher.retry(t.id)
+    assert repo.get_task(t.id).detail_code is None
 
 
 def test_task_verify_cmd_overrides_project(repo, dispatcher, fake_cli, project):
@@ -100,11 +116,12 @@ def test_process_verifying_isolates_failure_per_task(repo, dispatcher, fake_cli,
     # report.json) must not abort the processing of the other tasks in _process_verifying.
     t1 = _started(repo, dispatcher, project)
     t2 = _started(repo, dispatcher, project)
-    _write_report(t2)  # t1 has no report, but it will not get that far: read_report raises earlier
+    _write_report(t1)  # read_report raises on this one
+    _write_report(t2)
     fake_cli.set_state(t1.job_id, "done")
     fake_cli.set_state(t2.job_id, "done")
 
-    from orc.report import read_report as real_read_report
+    from orc.handoff import read_report as real_read_report
 
     broken_worktree = str(Path(t1.worktree_path))
 
@@ -113,8 +130,7 @@ def test_process_verifying_isolates_failure_per_task(repo, dispatcher, fake_cli,
             raise OSError("race while reading report.json")
         return real_read_report(worktree)
 
-    # We patch the symbol that is actually called from orc/dispatcher.py (imported there by name).
-    monkeypatch.setattr("orc.dispatcher.read_report", flaky_read_report)
+    monkeypatch.setattr("orc.handoff.read_report", flaky_read_report)
 
     # a full tick() would merge the task in the same call: here we check
     # the verify step itself, so the merge step is deliberately not run.
@@ -142,6 +158,7 @@ def test_removed_worktree_fails_task_with_event(repo, dispatcher, fake_cli, proj
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED
     assert "working copy" in t.blocker_detail
+    assert t.detail_code == "branch_gone"
     assert any(e["level"] == "error" and str(t.id) in e["message"] for e in repo.list_events())
 
 
@@ -164,6 +181,7 @@ def test_deleted_project_fails_verifying_task(repo, dispatcher, fake_cli, projec
     dispatcher._process_verifying()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED and "project" in t.blocker_detail
+    assert t.detail_code == "project_unavailable"
 
 
 def test_long_verify_does_not_block_tick(repo, dispatcher, fake_cli, project):
@@ -224,6 +242,7 @@ def test_deleted_project_fails_merging_task(repo, dispatcher, fake_cli, project,
     dispatcher._process_merging()
     t = repo.get_task(t.id)
     assert t.status == TaskStatus.FAILED and "project" in t.blocker_detail
+    assert t.detail_code == "project_unavailable"
 
 
 def test_retry_cancels_running_verify(repo, dispatcher, fake_cli, project):

@@ -10,7 +10,7 @@ import { focusRing } from "../ui/tokens";
 import { useTranslation } from "../i18n";
 
 interface Props {
-  request: InputRequest;
+  request: Omit<InputRequest, "task_id">;
   pending: boolean;
   /** Submit the decision. Returns true on success: the panel then resets the draft. */
   onDecide: (decision: InputDecision) => Promise<boolean>;
@@ -134,7 +134,7 @@ function PermissionForm({ request, pending, onDecide }: Props) {
   );
 }
 
-function questionsOf(request: InputRequest): Question[] {
+function questionsOf(request: Omit<InputRequest, "task_id">): Question[] {
   const raw = request.tool_input?.questions;
   if (!Array.isArray(raw)) return [];
   return raw.filter((q): q is Question => typeof q === "object" && q !== null && typeof (q as Question).question === "string");

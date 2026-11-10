@@ -101,12 +101,12 @@ def build_output(kind: str, data: dict, decision: dict) -> dict | None:
     return None
 
 
-def wait_decision(api: str, request_id: int, secret: str | None = None) -> dict | None:
+def wait_decision(api: str, request_id: int, secret: str | None = None, prefix: str = "input-requests") -> dict | None:
     """Poll the request while it is open. None means the request was closed without a decision or orc is gone."""
     unreachable_since: float | None = None
     while True:
         try:
-            row = _http("GET", f"{api}/api/hooks/input-requests/{request_id}", secret=secret)
+            row = _http("GET", f"{api}/api/hooks/{prefix}/{request_id}", secret=secret)
             unreachable_since = None
         except urllib.error.HTTPError as e:
             if e.code == 404:
@@ -132,7 +132,9 @@ def wait_decision(api: str, request_id: int, secret: str | None = None) -> dict 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--api", required=True)
-    parser.add_argument("--task", type=int, required=True)
+    owner = parser.add_mutually_exclusive_group(required=True)
+    owner.add_argument("--task", type=int)
+    owner.add_argument("--chat", type=int)
     parser.add_argument("--secret-file")
     args = parser.parse_args()
     secret = _read_secret(args.secret_file)
@@ -147,9 +149,12 @@ def main() -> int:
     if kind is None:
         return 0
     tool_input = data.get("tool_input") if isinstance(data.get("tool_input"), dict) else {}
+    # A chat has its own pair of endpoints: its requests live among the chat's messages, not on a card
+    prefix = "chat-input-requests" if args.chat is not None else "input-requests"
+    owner_field = {"chat_id": args.chat} if args.chat is not None else {"task_id": args.task}
     try:
-        created = _http("POST", f"{args.api}/api/hooks/input-requests", {
-            "task_id": args.task,
+        created = _http("POST", f"{args.api}/api/hooks/{prefix}", {
+            **owner_field,
             "session_id": data.get("session_id"),
             "cwd": data.get("cwd"),
             "kind": kind,
@@ -162,7 +167,7 @@ def main() -> int:
     request_id = created.get("id")
     if not isinstance(request_id, int):
         return 0
-    decision = wait_decision(args.api, request_id, secret=secret)
+    decision = wait_decision(args.api, request_id, secret=secret, prefix=prefix)
     if decision is None:
         return 0
     output = build_output(kind, {**data, "tool_input": tool_input}, decision)

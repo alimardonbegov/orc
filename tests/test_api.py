@@ -2,6 +2,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from tests.fakes import any_agent, to_work
 
 
 def test_projects_crud_and_validation(client, git_repo, tmp_path):
@@ -74,7 +75,7 @@ def test_tasks_crud_deps_and_status_moves(client, git_repo):
     b = client.post("/api/tasks", json={"project_id": 1, "title": "B", "description": "what to do", "depends_on": [a["id"]], "priority": "high"}).json()
     detail = client.get(f"/api/tasks/{b['id']}").json()
     assert detail["depends_on"] == [a["id"]] and detail["comments"] == []
-    r = client.patch(f"/api/tasks/{a['id']}", json={"status": "todo"})
+    r = client.patch(f"/api/tasks/{a['id']}", json=to_work(client))
     assert r.json()["status"] == "todo"
     r = client.patch(f"/api/tasks/{a['id']}", json={"status": "done"})
     assert r.status_code == 400  # moving to done by hand is not allowed
@@ -112,7 +113,7 @@ def test_position_is_stored_new_tasks_default_to_null(client, git_repo):
 def test_comment_answer_routes_to_dispatcher(client, repo, dispatcher, fake_cli, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     fake_cli.set_state("job00001", "blocked", needs="?")
     client.post("/api/dispatcher/tick")
@@ -134,7 +135,7 @@ def test_comment_answer_routes_to_dispatcher(client, repo, dispatcher, fake_cli,
 def test_comment_rework_returns_done_task_to_todo(client, repo, dispatcher, fake_cli, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     # Rework from done is allowed, from in_progress it is not
     r = client.post(f"/api/tasks/{t['id']}/comments", json={"body": "rework it", "kind": "rework"})
@@ -181,7 +182,7 @@ def test_failed_step_is_counted(client, dispatcher, monkeypatch):
 def test_retry_and_resume_endpoints(client, repo, git_repo, fake_cli):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     fake_cli.stop_marks_stopped = True  # the daemon confirms the stop: wake kills the live process and wakes the same job
     assert client.post(f"/api/tasks/{t['id']}/retry").status_code == 400  # not failed
@@ -196,13 +197,13 @@ def test_patch_failed_to_todo_goes_through_retry(client, repo, git_repo, fake_cl
     # otherwise the next dispatcher start would hit the already existing branch/worktree.
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     started = repo.get_task(t["id"])
     assert started.worktree_path and Path(started.worktree_path).exists()
     repo.update_task(t["id"], status="failed")
 
-    r = client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    r = client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     assert r.status_code == 200
     body = r.json()
     assert body["status"] == "todo"
@@ -230,14 +231,14 @@ def test_empty_description_task_is_not_allowed_into_work(client, git_repo, repo)
     # description means a session without an assignment: such a card is not sent to work.
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A"}).json()
-    r = client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    r = client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     assert r.status_code == 400 and "description is empty" in r.json()["detail"]
     assert repo.get_task(t["id"]).status == "backlog"
     # Whitespace does not count as a description, and the rejection must not write it into the card
-    r = client.patch(f"/api/tasks/{t['id']}", json={"description": "   ", "status": "todo"})
+    r = client.patch(f"/api/tasks/{t['id']}", json={"description": "   ", **to_work(client)})
     assert r.status_code == 400 and repo.get_task(t["id"]).description == ""
     # The description can be filled in and the task sent to work in a single request
-    r = client.patch(f"/api/tasks/{t['id']}", json={"description": "do the job", "status": "todo"})
+    r = client.patch(f"/api/tasks/{t['id']}", json={"description": "do the job", **to_work(client)})
     assert r.status_code == 200 and r.json()["status"] == "todo"
 
 
@@ -245,10 +246,10 @@ def test_retry_of_task_without_description_is_refused(client, git_repo, repo):
     # Old cards could have gone to work without a description: a repeated start does not revive them
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A"}).json()
-    repo.update_task(t["id"], status="failed")
+    repo.update_task(t["id"], status="failed", agent_id=any_agent(client))
     r = client.post(f"/api/tasks/{t['id']}/retry")
     assert r.status_code == 400 and "description is empty" in r.json()["detail"]
-    r = client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    r = client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     assert r.status_code == 400
     assert repo.get_task(t["id"]).status == "failed"
 
@@ -256,7 +257,7 @@ def test_retry_of_task_without_description_is_refused(client, git_repo, repo):
 def test_manual_moves_todo_to_backlog_and_done_to_backlog(client, git_repo, repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    r = client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    r = client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     assert r.json()["status"] == "todo"
     r = client.patch(f"/api/tasks/{t['id']}", json={"status": "backlog"})
     assert r.json()["status"] == "backlog"
@@ -313,7 +314,7 @@ def test_force_done_closes_failed_task(client, git_repo, repo):
 def test_force_done_stops_session_and_keeps_worktree(client, repo, dispatcher, fake_cli, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     started = repo.get_task(t["id"])
     assert started.status == "in_progress" and started.job_id
@@ -336,7 +337,7 @@ def test_force_done_fails_undelivered_messages(client, repo, dispatcher, fake_cl
     # Nobody is left to pick up the queued message: it must not hang as "waiting for delivery".
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
     client.post(f"/api/tasks/{t['id']}/comments", json={"body": "wait", "kind": "answer"})
     assert repo.pending_messages(t["id"])
@@ -356,7 +357,7 @@ def test_force_flag_does_not_open_other_manual_moves(client, git_repo, repo):
         assert r.status_code == 400, target
     # And conversely: for an ordinary task force breaks nothing and is not recorded anywhere.
     repo.update_task(t["id"], status="backlog")
-    r = client.patch(f"/api/tasks/{t['id']}", json={"status": "todo", "force": True})
+    r = client.patch(f"/api/tasks/{t['id']}", json={**to_work(client), "force": True})
     assert r.status_code == 200 and r.json()["status"] == "todo"
 
 
@@ -372,8 +373,8 @@ def test_add_task_validation_errors(client, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     r = client.post("/api/tasks", json={"project_id": 999, "title": "A", "description": "what to do"})
     assert r.status_code == 400
-    r = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do", "permission_mode": "bogus"})
-    assert r.status_code == 400
+    r = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do", "permission_mode": "auto"})
+    assert r.status_code == 422  # the card holds no run parameters of its own: they belong to its agent
 
 
 # ---------- concurrency, settings validation, blocker, requires_review ----------
@@ -527,7 +528,7 @@ def test_requires_review_is_refused_like_rework(client, git_repo):
 def test_answer_accepts_interrupt_mode_and_reports_outbox(client, repo, dispatcher, fake_cli, git_repo):
     client.post("/api/projects", json={"name": "demo", "path": str(git_repo)})
     t = client.post("/api/tasks", json={"project_id": 1, "title": "A", "description": "what to do"}).json()
-    client.patch(f"/api/tasks/{t['id']}", json={"status": "todo"})
+    client.patch(f"/api/tasks/{t['id']}", json=to_work(client))
     client.post("/api/dispatcher/tick")
 
     r = client.post(f"/api/tasks/{t['id']}/comments", json={"body": "stop", "kind": "answer", "mode": "interrupt"})

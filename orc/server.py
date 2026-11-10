@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
 from orc.api import router
+from orc import quick_create
 from orc.config import Settings, default_static_dir
 from orc.dispatcher import Dispatcher, DispatcherBusy
 from orc.repo import Repo
@@ -65,6 +66,8 @@ def create_app(settings: Settings, repo: Repo, dispatcher: Dispatcher,
             # Recalculating money at the new price list reads the transcripts of all tasks (seconds to a minute),
             # so it runs in the background: the board must not wait for it to open.
             threading.Thread(target=_reprice, args=(dispatcher,), daemon=True, name="orc-reprice").start()
+            # Chats poll their sessions far more often than the dispatcher pass runs, so they get a thread of their own
+            threading.Thread(target=dispatcher.chats.run, args=(stop,), daemon=True, name="orc-chats").start()
         yield
         stop.set()
         # We close the pool together with the server, killing running checks: otherwise the interpreter
@@ -89,6 +92,8 @@ def create_app(settings: Settings, repo: Repo, dispatcher: Dispatcher,
     # runs, and they work only while the object is shared by all requests (orc/usage.py).
     app.state.prober = Prober(settings.usage_cache_path, claude_bin=settings.claude_bin,
                               cwd=settings.data_dir, enabled=settings.usage_probe_enabled)
+    # What writes a card draft (orc/quick_create.py): replaced by tests, the model is a paid request
+    app.state.drafter = quick_create.run_claude(settings.claude_bin)
     app.include_router(router)
 
     if static_dir is not None and not (static_dir / "index.html").is_file():

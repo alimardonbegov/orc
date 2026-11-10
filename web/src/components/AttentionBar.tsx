@@ -12,6 +12,7 @@ interface Props {
   /** Tasks waiting for a human in OTHER projects: the dispatcher is shared, and a question
    * asked in a neighbouring project would otherwise be invisible until you switch there. */
   elsewhere?: Task[];
+  /** Open the card to answer it: the caller opens it at the end of its thread, where the question is. */
   onOpen: (id: number) => void;
 }
 

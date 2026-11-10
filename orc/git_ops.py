@@ -53,6 +53,19 @@ def git(args: list[str], cwd: Path, timeout: float = GIT_TIMEOUT_SEC) -> str:
     return proc.stdout.rstrip("\n")
 
 
+def main_repo_path(path: Path) -> Path | None:
+    """The main working copy of the repository `path` belongs to, from any of its worktrees.
+    None if this is not a repository, or a bare one."""
+    try:
+        proc = _run(["rev-parse", "--path-format=absolute", "--git-common-dir"], path)
+    except (GitError, OSError):
+        return None  # a folder that does not exist makes subprocess raise before git even runs
+    common = proc.stdout.strip()
+    if proc.returncode != 0 or not common.endswith("/.git"):
+        return None
+    return Path(common).parent
+
+
 # Default branch for repositories that orc creates itself. The name is set explicitly: otherwise
 # it depends on init.defaultBranch on the owner's machine, while the board shows this branch
 # in task cards and merges results into it.
@@ -229,6 +242,27 @@ def delete_branch(repo: Path, branch: str, force: bool = True) -> None:
 def is_dirty_tracked(path: Path) -> bool:
     # Tracked files only: the user's new files do not interfere with a merge and do not go into the auto-commit
     return bool(git(["status", "--porcelain", "--untracked-files=no"], path))
+
+
+def uncommitted_files(path: Path) -> tuple[list[str], list[str]]:
+    """What a commit would not carry yet: changed tracked files, and untracked ones (ignored files do not count)."""
+    proc = _run(["status", "--porcelain", "-z"], path)  # not git(): the status column can start with a space
+    if proc.returncode != 0:
+        raise GitError(f"git status in {path}: {proc.stderr.strip() or proc.stdout.strip()}")
+    tracked: list[str] = []
+    untracked: list[str] = []
+    entries = iter(proc.stdout.split("\0"))
+    for entry in entries:
+        if not entry:
+            continue
+        code, name = entry[:2], entry[3:]
+        if code == "??":
+            untracked.append(name)
+            continue
+        tracked.append(name)
+        if "R" in code or "C" in code:
+            next(entries, None)  # a rename carries its old name as one more entry
+    return tracked, untracked
 
 
 def autocommit_tracked(path: Path, message: str) -> bool:

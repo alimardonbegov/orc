@@ -31,7 +31,7 @@ def test_reaps_previous_job_after_copy(repo, dispatcher, fake_cli, project):
     t = _running(repo, dispatcher, project)
     old_job = t.job_id
     fake_cli.set_state(old_job, "done")
-    dispatcher.sessions.wake(t, "again")  # done → resume as a copy under a new job
+    dispatcher.sessions.wake(t, "again", trigger="message")  # done → resume as a copy under a new job
     t = repo.get_task(t.id)
     assert t.job_id != old_job
     fake_cli.set_state(old_job, "working", tempo="idle")  # the old process came back to life / did not die
